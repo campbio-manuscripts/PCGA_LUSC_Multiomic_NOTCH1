@@ -1,0 +1,294 @@
+---
+title: "Co-Mutation Heatmaps"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  bookdown::html_document2:
+    css: styles.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### Libraries and Paths
+
+```{r libraries-paths}
+library(tidyr)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+source("/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Scripts/readData.R")
+
+data_dir <- "/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Data"
+```
+
+### Load Input Data
+
+```{r load-data}
+annotations <- read_xlsx(file.path(data_dir, "20240802-PCGA-01-Metadata-New.xlsx"))
+exome.seq <- read.delim(file.path(data_dir, "20200201_PCGA_Exome_with_MuTect2PON.maf"))
+exome.seq$Tumor_Sample_Barcode <- substr(exome.seq$Tumor_Sample_Barcode,1,30)
+exome.maf <- coding.maf(exome.seq)
+
+target.seq <- read.delim(file.path(data_dir, "20191115_PCGA_Targeted_with_MuTect2PON.maf"))
+target.seq$Tumor_Sample_Barcode <- substr(target.seq$Tumor_Sample_Barcode,1,30)
+target.maf <- coding.maf(target.seq)
+
+driver_genes <- read.table(file.path(data_dir, "lusc_genes.txt"))[,1]
+```
+
+### Setting heatmap legends
+
+```{r figure-legend}
+threeq_legend <- Legend(
+  labels = c("Yes", "No"),
+  legend_gp = gpar(fill = c("black","grey")),
+  labels_gp = gpar(fontsize = 4),
+  title = "3q gain",
+  grid_width = unit(2.5, "mm"),  
+  grid_height = unit(0.5, "mm"), 
+  title_position = "topleft",
+  title_gp = gpar(fontsize = 4, fontface = "bold")
+)
+
+threep_legend <- Legend(
+  labels = c("Yes", "No"),
+  legend_gp = gpar(fill = c("#4A4A4A","grey93")),
+  labels_gp = gpar(fontsize = 4),
+  title = "3p loss",
+  grid_width = unit(2.5, "mm"),  
+  grid_height = unit(0.5, "mm"), 
+  title_position = "topleft",
+  title_gp = gpar(fontsize = 4, fontface = "bold")
+)
+mutation_legend <- Legend(
+  labels = c("Missense Mutation", "Splice Site", "In Frame Del/Ins", 
+             "Frame Shift Del/Ins", "Nonsense Mutation"),  # Legend labels
+  legend_gp = gpar(fill = c( "#0072B2", "#8856a7", "#FFFF33", "#E69F00", "#c51b8a")),
+  labels_gp = gpar(fontsize = 4),
+  title = "Mutation Type",
+  grid_width = unit(2.5, "mm"),  
+  grid_height = unit(0.5, "mm"), 
+  title_position = "topleft",
+  title_gp = gpar(fontsize = 4, fontface = "bold")
+)
+
+hist_legend <- Legend(
+  labels = c("Normal", "Hyperplasia", "Metaplasia",
+             "Mild Dysplasia", "Moderate Dysplasia", "Severe Dysplasia","Brush"),
+  legend_gp = gpar(fill = c("grey45", "#3c68b0", "#F4AD31", "#FC9272", "#FB6A4A", "#DE2D26","skyblue")),
+  labels_gp = gpar(fontsize = 4),
+  title = "Histology",
+  grid_width = unit(2.5, "mm"),  
+  grid_height = unit(0.5, "mm"), 
+  title_position = "topleft",
+  title_gp = gpar(fontsize = 4, fontface = "bold")
+)
+
+outcome_legend <- Legend(
+  labels = c("unknown", "stable", "regressive", "progressive", "persistent"),
+  legend_gp = gpar(fill = c("#E0E0E0","#B0BEC5","#00796B", "#FB8C00","#cd7058")),
+  labels_gp = gpar(fontsize = 4),
+  title = "Outcome",
+  grid_width = unit(2.5, "mm"),  
+  grid_height = unit(0.5, "mm"), 
+  title_position = "topleft",
+  title_gp = gpar(fontsize = 4, fontface = "bold")  
+)
+
+timepoint_legend <- Legend(
+  labels = c(1,2,3),
+  legend_gp = gpar(fill = RColorBrewer::brewer.pal(3, "Pastel1")),
+  labels_gp = gpar(fontsize = 4),
+  title = "Time point",
+  grid_width = unit(2.5, "mm"),  
+  grid_height = unit(0.5, "mm"), 
+  title_position = "topleft",
+  title_gp = gpar(fontsize = 4, fontface = "bold")
+)
+
+lgd_list <- packLegend(outcome_legend, timepoint_legend, hist_legend, mutation_legend, threeq_legend, threep_legend,
+                       max_height = unit(5, "cm"), 
+                       column_gap = unit(0.3, "cm"))
+
+col_fun = colorRamp2(c(0, 1, 2, 3, 4, 5), c("white", "#8856a7", "#c51b8a", "#FFFF33", "#E69F00", "#0072B2"))
+```
+
+### Helper Functions
+```{r helpers}
+get_sample_order <- function(patient_num, maf_file, data_annot){
+  ann <- data_annot[data_annot$Patient == patient_num &
+                     data_annot$Tumor_Sample_Barcode %in% maf_file$Tumor_Sample_Barcode,
+                     c("Tumor_Sample_Barcode", "Time")]
+  ann <- ann[order(ann$Time, ann$Tumor_Sample_Barcode), ]
+  return(ann$Tumor_Sample_Barcode)
+}
+get_mut_matrix <- function(patient_num, maf_file, sample_order, data_annot, extra_driver_genes = NULL){
+  samples <- data_annot$Tumor_Sample_Barcode[data_annot$Patient == patient_num]
+
+  maf.x = subset(maf_file, maf_file$Tumor_Sample_Barcode %in% samples)
+  temp = apply(maf.x[,c("Hugo_Symbol", "Chromosome","Reference_Allele", "Tumor_Seq_Allele2", "Protein_Change")], 1, paste, collapse="_")
+  temp = gsub(" ", "", temp)
+  maf.x$Hugo_Symbol = temp
+  
+  maf.x <- maf.x %>% mutate(Tumor_Sample_Barcode = as.character(Tumor_Sample_Barcode),
+                           Variant_Classification = as.character(Variant_Classification))
+  
+  samples  <- maf.x$Tumor_Sample_Barcode
+  genes    <- maf.x$Hugo_Symbol
+  variants <- maf.x$Variant_Classification
+  
+  mydat <- data.frame(genes, samples, variants)
+  # Reshape data: Spread into a wide matrix (rows = genes, columns = samples)
+  mutation_matrix <- mydat %>%
+    distinct(.,) %>%
+    pivot_wider(names_from = samples, values_from = variants, values_fill = " ") %>% data.frame()
+  
+  rownames(mutation_matrix) <- mutation_matrix[,1]
+  mutation_matrix <- mutation_matrix |>
+    select(! genes) |>
+    mutate(across(everything() , ~ case_when(
+      . == "Splice_Site" ~ 1,
+      . == "Nonsense_Mutation" ~ 2,
+      .  %in% c("In_Frame_Del", "In_Frame_Ins") ~ 3,
+      .  %in% c("Frame_Shift_Del", "Frame_Shift_Ins") ~ 4,
+      . == "Missense_Mutation" ~ 5,
+      TRUE ~ 0
+    )))
+  
+  mutation_matrix_fixed <- as.matrix(sapply(mutation_matrix, as.numeric))
+  rownames(mutation_matrix_fixed) <- rownames(mutation_matrix)
+  
+  colnames(mutation_matrix_fixed) <- gsub(x = colnames(mutation_matrix_fixed), pattern = "\\.", replacement = "-") 
+  mutation_matrix_fixed <- mutation_matrix_fixed[,sample_order]
+  
+  indexes <- which(rowSums(mutation_matrix_fixed)>0)
+  mutation_matrix_fixed <- mutation_matrix_fixed[indexes,sample_order]
+  
+  # keeping mutations in driver genes only (plus any patient-specific extra genes)
+  driver_set <- c(driver_genes, extra_driver_genes)
+  row_labels <- ifelse(word(rownames(mutation_matrix_fixed),1,sep = "\\_") %in% driver_set,
+                       rownames(mutation_matrix_fixed), "")
+
+  first <- gsub("_.*", "",row_labels)
+  last <- gsub(".*(_[^_]*)$", "\\1", row_labels)
+  row_labels <- paste0(first,last)
+
+  return(list(matrix = mutation_matrix_fixed, row_labels = row_labels))
+}
+
+get_pt_annot <- function(sample_order, gain_loss_ids = NULL){
+  ann <- annotations[annotations$Tumor_Sample_Barcode %in% sample_order, c("Tumor_Sample_Barcode", "Histology",           "Outcome", "Location_Name", "Time")] |>
+  data.frame() |> dplyr::rename(Region = Location_Name, "Time point" = Time)
+
+ann$`Time point` <- factor(dense_rank(ann$`Time point`))
+ann$`3q gain` <- ifelse(ann$Tumor_Sample_Barcode %in% gain_loss_ids, "Yes", "No")
+ann$`3p loss` <- ifelse(ann$Tumor_Sample_Barcode %in% gain_loss_ids, "Yes", "No")
+ann <- ann[match(sample_order, ann$Tumor_Sample_Barcode),]
+time_points <- RColorBrewer::brewer.pal(9, "Pastel1")[1:length(levels(ann$`Time point`))]
+names(time_points) <- levels(ann$`Time point`)
+
+return(list(ann = ann, time_points = time_points))
+}
+
+set_annot_bars <- function(ann, row_labels, time_points, annotation_name_side = "left", show_annotation_name = TRUE){
+  top_ann <- HeatmapAnnotation(df = ann[, !(names(ann) %in% c("Tumor_Sample_Barcode", "Region"))],
+                             col = list(Histology = c("Normal" = "grey45",
+                                                      "Brush" = "skyblue",
+                                                      "Hyperplasia" = "#3c68b0",
+                                                      "Metaplasia" = "#F4AD31",
+                                                      "Mild Dysplasia" = "#FC9272", 
+                                                      "Moderate Dysplasia" = "#FB6A4A",
+                                                      "Severe Dysplasia" = "#DE2D26"),
+                                        Outcome = c("regressive" = "#00796B", 'progressive' = "#FB8C00", "persistent" = "#cd7058",
+                                                    "unknown" = "#E0E0E0", "stable" = "#B0BEC5"),
+                                        "Time point" = time_points,
+                                        "3q gain" = c("Yes" = "black", "No" = "grey"),
+                                        "3p loss" = c("Yes" = "#4A4A4A", "No" = "grey93")),
+                             Region = anno_text(ann[,"Region"], location = unit(0.5,"npc"),
+                                                just = "center", rot = 90, show_name = T, gp = gpar(fontsize = 5)),
+                             simple_anno_size = unit(0.15, "cm"),
+                             annotation_name_gp = gpar(fontsize = 5), annotation_name_side = annotation_name_side,
+                             show_legend = F, show_annotation_name = show_annotation_name)
+
+bottom_ann <- HeatmapAnnotation(Samples = anno_text(ann[,"Tumor_Sample_Barcode"], location = unit(0.5,"npc"),
+                                                    just = "center", rot = 45, show_name = F, gp = gpar(fontsize = 5)))
+
+label_rows <- which(row_labels != "")
+label_texts <- row_labels[label_rows]
+
+row_anno <- rowAnnotation(
+  gene_labels = anno_mark(at = label_rows, labels = label_texts,
+                          labels_gp = gpar(fontsize = 4), side = "left")
+)
+
+return(list(top_ann = top_ann, bottom_ann = bottom_ann, row_anno = row_anno))
+}
+```
+
+### Plotting
+
+```{r patient9, fig.height=4, fig.width=3, fig.align='center', fig.dpi=300, fig.cap="Figure 2C", message=FALSE, warning=FALSE}
+samples.9.ord <- get_sample_order(patient_num = 9, maf_file = exome.maf, data_annot = annotations) |>
+  as.character()
+# here we plot just two samples from patient 9
+samples.9.ord <- c("PCGA-01-0009-086-23882-00993BX", "PCGA-01-0009-092-24085-01209BX")
+mut.9 <- get_mut_matrix(patient_num = 9, maf_file = exome.maf,
+                        sample_order = samples.9.ord, data_annot = annotations)
+
+pt.9 <- get_pt_annot(sample_order = samples.9.ord)
+
+bars.9 <- set_annot_bars(ann = pt.9$ann, row_labels = mut.9$row_labels,
+                         time_points = pt.9$time_points)
+
+ht.pt9 <- Heatmap(mut.9$matrix, show_row_names = F, show_column_names = F,
+                  row_names_side = "left", col = col_fun, show_row_dend = F, 
+                  show_column_dend = F, border = TRUE, show_heatmap_legend = F,
+                  top_annotation = bars.9$top_ann, bottom_annotation = bars.9$bottom_ann,
+                  left_annotation = bars.9$row_anno)
+
+draw(ht.pt9, annotation_legend_list = lgd_list,
+     annotation_legend_side = "right", heatmap_legend_side = "right")
+```
+
+```{r patient40-target, fig.height=4, fig.width=3.5, fig.align='center', fig.dpi=300, fig.cap="Figure 2D", message=FALSE, warning=FALSE}
+samples.40.target.ord <- get_sample_order(patient_num = 40, maf_file = target.maf, data_annot = annotations)
+
+mut.40.target <- get_mut_matrix(patient_num = 40, maf_file = target.maf,
+                                sample_order = samples.40.target.ord, data_annot = annotations,
+                                extra_driver_genes = c("SMARCA4", "KEAP1"))
+
+# label patch specific to this figure
+mut.40.target$row_labels <- ifelse(mut.40.target$row_labels == 'NOTCH1_',
+                                   paste0(mut.40.target$row_labels, "Splice site"), mut.40.target$row_labels)
+
+pt.40.target <- get_pt_annot(sample_order = samples.40.target.ord,
+                             gain_loss_ids = "PCGA-01-0040-093-19895-01283BX")
+
+bars.40.target <- set_annot_bars(ann = pt.40.target$ann, row_labels = mut.40.target$row_labels,
+                                 time_points = pt.40.target$time_points,
+                                 annotation_name_side = "right", show_annotation_name = TRUE)
+
+ht.pt40.target <- Heatmap(mut.40.target$matrix, row_labels = mut.40.target$row_labels,
+                          row_names_side = "left", row_names_gp = gpar(fontsize = 4),
+                          col = col_fun, show_row_dend = F, cluster_columns = FALSE,
+                          show_column_dend = F, show_column_names = F,
+                          border = T, show_heatmap_legend = F,
+                          top_annotation = bars.40.target$top_ann, bottom_annotation = bars.40.target$bottom_ann)
+
+draw(ht.pt40.target, annotation_legend_list = lgd_list,
+     annotation_legend_side = "right", heatmap_legend_side = "right")
+```
+
+### Session Information
+
+```{r}
+sessionInfo()
+```
+

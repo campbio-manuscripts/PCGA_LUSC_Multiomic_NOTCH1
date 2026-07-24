@@ -1,0 +1,205 @@
+---
+title: "Overlapping Mutation Analysis"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  bookdown::html_document2:
+    css: styles.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### Libraries and Paths
+
+```{r libraries-paths}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(ggpattern)
+library(forcats)
+source("/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Scripts/readData.R")
+
+data_dir <- "/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Data"
+```
+
+### Load Input Data
+
+```{r load-data}
+pcga.file <- read.delim(file.path(data_dir, "20200201_PCGA_Exome_with_MuTect2PON.maf"))
+pcga.file$Tumor_Sample_Barcode <- substr(pcga.file$Tumor_Sample_Barcode,1,30)
+
+exonic.vars <- c("Silent", "Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins", 
+                 "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation", "Translation_Start_Site",
+                 "Splice_Site", "De_novo_Start_InFrame", "De_novo_Start_OutOfFrame", "Stop_Codon_Del", 
+                 "Stop_Codon_Ins", "Start_Codon_Del", "Start_Codon_Ins")
+
+pcga.file <- pcga.file[pcga.file$Variant_Classification %in% exonic.vars,]
+```
+
+### Overlapping Set of Mutations
+
+```{r find-overlaps}
+pcga.dat <- pcga.file[, c("Tumor_Sample_Barcode", "Hugo_Symbol",
+                           "Chromosome", "Start_position", "End_position",
+                           "Reference_Allele", "Tumor_Seq_Allele2")]
+
+pcga.dat$Patient_code <- substr(pcga.dat$Tumor_Sample_Barcode, 9, 12)
+
+head(pcga.dat)
+
+setDT(pcga.dat)
+
+all_samples <- unique(pcga.dat$Tumor_Sample_Barcode)
+n_samples   <- length(all_samples)
+n_pairs     <- n_samples * (n_samples - 1L) / 2L
+
+results_list <- vector("list", n_pairs)
+pair_idx     <- 0L
+
+for (i in seq_len(n_samples - 1L)) {
+
+  sample.1  <- all_samples[i]
+  samp1.dat <- pcga.dat[Tumor_Sample_Barcode == sample.1,
+                        .(Chromosome, Start_position, End_position,
+                          Reference_Allele, Tumor_Seq_Allele2)]
+
+  samp1.dat[, key := paste(Chromosome, Start_position, End_position,
+                           Reference_Allele, Tumor_Seq_Allele2, sep = ":::")]
+
+  for (j in (i + 1L):n_samples) {
+
+    sample.2  <- all_samples[j]
+    samp2.dat <- pcga.dat[Tumor_Sample_Barcode == sample.2,
+                          .(Chromosome, Start_position, End_position,
+                            Reference_Allele, Tumor_Seq_Allele2)]
+
+    samp2.dat[, key := paste(Chromosome, Start_position, End_position,
+                             Reference_Allele, Tumor_Seq_Allele2, sep = ":::")]
+
+    n_overlaps <- nrow(merge(samp1.dat, samp2.dat, by = "key"))
+
+    pair_idx <- pair_idx + 1L
+    results_list[[pair_idx]] <- data.frame(
+      pair            = paste0(sample.1, ":", sample.2),
+      same_patient    = substr(sample.1, 9, 12) == substr(sample.2, 9, 12),
+      num_of_overlaps = n_overlaps,
+      mut_samp1       = nrow(samp1.dat),
+      mut_samp2       = nrow(samp2.dat),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+overlap_sets <- do.call(rbind, results_list)
+
+```
+
+### Test Statistical Significance of Overlaps
+
+```{r fisher-test}
+total <- length(unique(
+  paste(pcga.dat$Chromosome,
+        pcga.dat$Start_position,
+        pcga.dat$End_position,
+        pcga.dat$Reference_Allele,
+        pcga.dat$Tumor_Seq_Allele2,
+        sep = ":::")
+))
+results <- vector("list", nrow(overlap_sets))
+for (x in seq_len(nrow(overlap_sets))) {
+
+  a <- overlap_sets$num_of_overlaps[x]
+  b <- overlap_sets$mut_samp1[x] - a   # in S1 only
+  c <- overlap_sets$mut_samp2[x] - a   # in S2 only
+  d <- total - a - b - c               # in neither
+
+  M <- matrix(
+    c(a, b, 
+      c, d), 
+    nrow = 2, ncol = 2,
+    byrow = TRUE,
+    dimnames = list(
+      c("S1 mutated", "S1 not mutated"),
+      c("S2 mutated", "S2 not mutated")
+    )
+  )
+    results[[x]] <- fisher.test(M, alternative = "greater")$p.value
+}
+
+names(results) <- overlap_sets$pair
+results_df          <- tibble::enframe(results, name = "pair", value = "p.value")
+results_df$p.value  <- unlist(results_df$p.value)
+results_df$FDR      <- p.adjust(results_df$p.value, method = "fdr")
+```
+
+### Plot Significant Overlaps Across Sample Pairs
+
+```{r plot-results, fig.width=3.5, fig.height=2.5, fig.align='center', fig.dpi=300, fig.cap="Figure 2B", message=FALSE, warning=FALSE}
+plot_data <- merge(results_df, overlap_sets[, c("pair", "num_of_overlaps", "same_patient", "mut_samp1",
+                                                "mut_samp2")], by = "pair")
+plot_data$`q-value` = -log10(plot_data$FDR)
+head(plot_data)
+
+df <- plot_data[plot_data$num_of_overlaps > 1, ] %>% 
+  select(., c(1, 3:5)) %>% 
+  mutate(Significance = ifelse(FDR < 0.05, "Clonally related", "Clonally independent"),
+         same_patient = ifelse(same_patient, "Within patient", "Across patients")) %>%
+  rename("Sample pairing" = same_patient) %>%
+  arrange(desc(num_of_overlaps))
+
+df$pair <- gsub("[0-9]*:","\n",df$pair)
+
+gg = ggplot(data = df, aes(x=forcats::fct_reorder(pair, as.numeric(rownames(df))), 
+                           y = num_of_overlaps, 
+                           fill = Significance,
+                           color = `Sample pairing`)) + 
+  geom_col_pattern(aes(pattern = `Sample pairing`),
+                   position = position_dodge(preserve = "single"),
+                   width = 0.8, linewidth = 0.5, color = "black", 
+                   pattern_fill = "black",
+                   pattern_angle = 90,
+                   pattern_density = 0.001,
+                   pattern_spacing = 0.025,
+                   pattern_key_scale_factor = 0.6) + 
+  scale_pattern_manual(
+    values = c(
+      "Within patient"  = "stripe",
+      "Across patients" = "none"
+    )
+  ) +
+  theme_classic() + 
+  theme(axis.text.x = element_text(angle = 25, hjust = 1, family = "Helvetica", size = 3, colour = "black"), 
+        axis.text.y = element_text(family = "Helvetica", size = 3, colour = "black"), 
+        axis.title.x = element_text(size = 5, family = "Helvetica"), 
+        axis.title.y = element_text(size = 5, family = "Helvetica"), 
+        legend.title = element_text(size = 5, family = "Helvetica"), 
+        legend.text = element_text(size = 4, family = "Helvetica"),
+        axis.ticks.x = element_line(linewidth = 0.25), 
+        axis.ticks.y = element_line(linewidth = 0.25),
+        #legend.position = c(0.65, 0.75),
+        legend.key.size = unit(0.2,"cm"),
+        legend.spacing = unit(0.01, "cm"),
+        plot.margin = unit(c(0.2,0,0,0.5), "cm")) + 
+  scale_y_continuous(expand = c(0,0)) + 
+  scale_fill_manual(values = c("grey", "red3")) +  
+  scale_color_manual(values = c(NA, "black")) +  # Black outline for TRUE, no outline for FALSE
+  labs(y = "# overlapping mutations", x = "Samples pair", 
+       fill = "FET-FDR < 0.05") +   
+  theme(
+    axis.line.x = element_line(linewidth = 0.3),
+    axis.line.y = element_line(linewidth = 0.3) 
+  ) + guides(pattern = guide_legend(override.aes = list(fill = "grey")))
+print(gg)
+```
+
+### Session Information
+
+```{r}
+sessionInfo()
+```
+

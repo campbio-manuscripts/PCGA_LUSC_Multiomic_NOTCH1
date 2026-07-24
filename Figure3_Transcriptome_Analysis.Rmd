@@ -1,0 +1,532 @@
+---
+title: "RNA-Seq Data Analysis"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  bookdown::html_document2:
+    css: styles.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### Libraries and Paths
+
+```{r libraries-paths}
+library(GSVA)
+library(tidyr)
+library(dplyr)
+library(edgeR)
+library(limma)
+library(fgsea)
+library(readxl)
+library(ggpubr)
+library(rstatix)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ComplexHeatmap)
+library(biomaRt)
+library(msigdbr)
+library(maftools)
+library(writexl)
+library(SummarizedExperiment)
+source("/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Scripts/readData.R")
+
+data_dir <- "/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Data"
+```
+
+### Load Input Data
+
+```{r load-data}
+sequenced.samples <- read.table(file.path(data_dir, "20191115_targeted_pairs.txt"),sep="\t", header=T)
+# target.maf <- read.maf(maf = file.path(data_dir, "20191115_PCGA_Targeted_with_MuTect2PON.maf"))
+pcga.annot <- read_xlsx(file.path(data_dir, "20240802-PCGA-01-Metadata-New.xlsx"))
+
+target.dat <- read.delim(file.path(data_dir, "20250810_PCGA_Targeted_with_MuTect2PON.maf"))
+target.dat$Tumor_Sample_Barcode <- substr(target.dat$Tumor_Sample_Barcode,1,30)
+
+target.maf <- ReadMaf(maf = target.dat, metadata = pcga.annot)
+
+# RNA-seq cohort metadata
+pcga.rna.annotation <- read.table(file.path(data_dir, "GSE109743_SAMPLES.txt"), sep="\t", row.names=1, header=T)
+
+# reading the mRNA expression matrix
+pcga.rnaseq <- read.table(file.path(data_dir, "GSE109743_exp_count.txt"), sep="\t", header=T, row.names=1)
+
+notch.pathway.genes <- readRDS(file.path(data_dir, "notch.pathway.genes.rds"))
+```
+
+### Data Harmonization
+
+```{r harmonization}
+pcga.annot <- DataFrame(pcga.annot)
+pcga.rnaseq.annot <- DataFrame(pcga.rna.annotation, rownames(pcga.rna.annotation))
+
+# summarized experiment object of mRNA exp matrix
+pcga.rnaseq.se <- SummarizedExperiment(assays = SimpleList(counts=as.matrix(pcga.rnaseq)), 
+                                       colData = pcga.rnaseq.annot)
+
+# Subset to high-quality data and endobronchial biopsies
+pcga.biopsy <- pcga.rnaseq.se[,intersect(which(colData(pcga.rnaseq.se)$characteristics..passed.QC==TRUE),
+                                         which(colData(pcga.rnaseq.se)$source.name=="endobronchial biopsy"))]
+
+pcga.biopsy@colData$histology <- pcga.annot$Histology[match(substr(colData(pcga.biopsy)$title,1,30),
+                                                            pcga.annot$Tumor_Sample_Barcode)]
+
+# Find samples the overlap RNA-seq and target-seq
+overlapping.samples <- intersect(substr(colData(pcga.biopsy)$title,1,30),
+                                 substr(sequenced.samples$CASE_ID,1,30))
+
+# RNA IDs for overlapping samples
+overlapping.samples.RNAID <- colData(pcga.biopsy)$title[match(overlapping.samples,
+                                                              substr(colData(pcga.biopsy)$title,1,30))]
+
+# DNA IDs for overlapping samples
+overlapping.samples.DNAID <- sequenced.samples$CASE_ID[match(overlapping.samples,
+                                                             substr(sequenced.samples$CASE_ID,1,30))]
+
+# Subset gene expression matrix to include overlapping samples only
+pcga.biopsy <- pcga.biopsy[, match(overlapping.samples.RNAID, colData(pcga.biopsy)$title)]
+notch.maf <- subsetMaf(maf = target.maf, tsb = substr(overlapping.samples.DNAID,1,30), genes = c("NOTCH1"), query = "tumor_f >= 0.01")
+notch.maf.samples <- getSampleSummary(notch.maf)
+
+rownames(pcga.annot) <- pcga.annot$Tumor_Sample_Barcode
+
+smoking.status <- pcga.annot[substr(overlapping.samples.RNAID,1,30), "Genomic_Smoking_Status"]
+smoking.status <- factor(smoking.status,levels = c("Former","Current"))
+
+progression.status <- pcga.annot[substr(overlapping.samples.RNAID,1,30), "Outcome"]
+progression.status <- as.factor(progression.status)
+```
+
+### Data Filtration
+
+```{r filtration}
+data.dge <- DGEList(counts=assays(pcga.biopsy)$counts)
+
+# Scale Normalization using GLM
+data.dge <- calcNormFactors(data.dge,method = "TMM")
+
+# log-transformed, library-size-adjusted expression matrix
+data.cpm <- cpm(data.dge, log = TRUE)
+test1 <- apply(data.cpm, 1, IQR) # interquartile range (IQR) for each gene across samples
+test2 <- apply(data.cpm, 1, sum)
+
+# genes with IQR = 0, or genes with total expression <=1 are uninformative (have no variability)
+low.genes <- union(which(test1 == 0), which(test2 <= 1))
+gene.ind <- setdiff(1:nrow(data.cpm), low.genes)
+
+# remove the lowly expressed genes and calculate the norm factor again
+data.dge.filtered <- data.dge[gene.ind, keep.lib.sizes = F] # recalculate library sizes
+data.dge.filtered <- calcNormFactors(data.dge.filtered, method = "TMM")
+data.cpm.filtered <- cpm(data.dge.filtered, log = TRUE) # log2 transformed counts per million values of filtered genes
+```
+
+### Differential Expression through Linear Mixed-Effects Model
+
+```{r linear-model}
+notch.status <- rep("WT", length = ncol(data.dge.filtered))
+notch.status[match(notch.maf.samples$Tumor_Sample_Barcode,
+                   substr(colData(pcga.biopsy)$title, 1, 30))] <- "MT"
+notch.status <- factor(notch.status, levels = c("WT","MT"))
+
+design <- model.matrix(~as.numeric(colData(pcga.biopsy)$characteristics..median.TIN) + 
+                         as.factor(as.character(colData(pcga.biopsy)$characteristics..flowcell.ID)) + 
+                         as.factor(smoking.status) + as.factor(notch.status))
+
+v <- voom(data.dge.filtered, design = design)
+
+pat.block <- as.factor(as.character(colData(pcga.biopsy)$characteristics..patient.ID))
+dupcor <- duplicateCorrelation(v, design, block = pat.block)
+print(dupcor$consensus.correlation)
+
+# linear model
+fit <- lmFit(v, design, block = pat.block, correlation = dupcor$consensus.correlation)
+fit <- eBayes(fit)
+
+result <- topTable(fit, coef = ncol(fit), adjust.method = "fdr", number = nrow(data.dge.filtered))
+# joint smoking + notch effect. smoking is the second-to-last term and notch the last term
+result.1 <- topTable(fit, coef = c(ncol(fit)-1, ncol(fit)), adjust.method = "fdr", number = nrow(data.dge.filtered))
+# significant genes identified in DEG analysis
+sig.result <- result[which(result$adj.P.Val<0.05 & abs(result$logFC) >= log2(1.25)),]
+
+#compute residual gene expression for heatmap plotting
+design.r <- model.matrix(~as.numeric(colData(pcga.biopsy)$characteristics..median.TIN) + 
+                           as.factor(as.character(colData(pcga.biopsy)$characteristics..flowcell.ID)) +
+                           as.factor(smoking.status))
+
+v.r <- voom(data.dge.filtered, design = design.r)
+dupcor.r <- duplicateCorrelation(v.r, design.r, block = pat.block)
+print(dupcor.r$consensus.correlation)
+
+fit.r <- lmFit(v.r, design.r, block = pat.block, correlation = dupcor.r$consensus.correlation)
+fit.r <- eBayes(fit.r)
+residuals <- residuals(fit.r, v.r)
+```
+
+### DEG Heatmap
+
+```{r heatmap-prep}
+mt.types <- as.matrix(notch.maf.samples[,2:(ncol(notch.maf.samples)-1)])
+rownames(mt.types) <- as.matrix(notch.maf.samples[,1])
+M <- mt.types
+
+mt.types[M>=1] <- "YES"
+mt.types[M==0] <- "NO"
+mt.types.all <- matrix("NO",nrow=ncol(residuals),ncol=ncol(mt.types))
+
+rownames(mt.types.all) <- colnames(residuals)
+
+mt.types.all[match(substr(rownames(mt.types),1,30),substr(colData(pcga.biopsy)$title,1,30)),] <- mt.types
+
+colnames(mt.types.all) <- colnames(mt.types)
+
+mt.types.all <- as.data.frame(mt.types.all)
+
+mt.types.all <- mt.types.all %>% mutate(priority = case_when(
+  Nonsense_Mutation == "YES" | Frame_Shift_Del == "YES" | Frame_Shift_Ins == "YES" ~ "lof",
+  Splice_Site == "YES" ~ "splice.site",
+  Missense_Mutation == "YES" ~ "missense",
+  TRUE ~ "none"
+))
+
+mt.count <- rep(0,length=ncol(data.dge.filtered))
+mt.count[match(notch.maf.samples$Tumor_Sample_Barcode,
+               substr(colData(pcga.biopsy)$title,1,30))] <- notch.maf.samples$total
+
+mat_col <- data.frame(notch.status = as.factor(notch.status), mt.count = mt.count,
+                      notch.mt.type = as.factor(mt.types.all$priority),
+                      mol.subtype = as.factor(as.character(colData(pcga.biopsy)$characteristics..molecular.subtype)),
+                      histology = gsub(" ",".",as.factor(as.character(colData(pcga.biopsy)$characteristics..dysplasia.grade))),
+                      smoking.status = as.factor(smoking.status),
+                      progression.status = as.factor(progression.status))
+
+rownames(mat_col) = colnames(pcga.biopsy)
+
+normalized.data <- t(scale(t(residuals[rownames(sig.result),]), center = T, scale = T)) # z-score, standardize each gene (mean = 0, sd = 1)
+
+# Perform PCA
+n <- normalized.data
+n <- t(n) # sample by gene matrix
+sample_pca <- prcomp(n) # pca on rows (samples)
+
+head(sample_pca$rotation)[,"PC1"]
+pc1 <- sample_pca$x[,"PC1"]
+pc1 <- sort(pc1, decreasing = TRUE)
+
+mat_col1 <- mat_col[match(names(pc1),row.names(mat_col)), ]
+normalized.data1 <- normalized.data[,match(names(pc1),colnames(normalized.data))] # samples are ordered left-to-right in decreasing PC1 value
+
+# to avoid extreme color scaling in the heatmap, z-scores are truncated to lie in [-2,2]
+normalized.data1[normalized.data1 < -2] <- -2
+normalized.data1[normalized.data1 > 2] <- 2
+```
+
+```{r heatmap-plot, fig.dpi=300, fig.cap="Figure 3G"}
+mat_col1 <- mat_col1 |> dplyr::rename(Outcome = progression.status,
+                                      Histology = histology,
+                                      `Genomic smoking status` = smoking.status,
+                                      `Notch mutation status` = notch.status,
+                                      `Notch mutation type` = notch.mt.type,
+                                      `Mutation count` = mt.count,
+                                      `Molecular subtype` = mol.subtype) |>
+  dplyr::select(Outcome, Histology, `Genomic smoking status`, `Notch mutation status`, `Notch mutation type`, `Molecular subtype`, `Mutation count`)
+
+levels(mat_col1$Outcome)[levels(mat_col1$Outcome) == "normal.stable"] <- "stable"
+levels(mat_col1$Outcome)[levels(mat_col1$Outcome) == "progressive.persistent"] <- "progressive/persistent"
+
+mat_col1 <- mat_col1 |> mutate(Histology = case_when(Histology == 'normal' ~ "Normal",
+                                                     Histology == 'hyperplasia' ~ "Hyperplasia",
+                                                     Histology == 'metaplasia' ~ "Metaplasia",
+                                                     Histology == 'mild.dysplasia' ~ 'Mild dysplasia',
+                                                     Histology == 'moderate.dysplasia' ~ 'Moderate dysplasia',
+                                                     TRUE ~ 'Severe dysplasia'))
+
+mat_col1$`Notch mutation status` <- factor(mat_col1$`Notch mutation status`, levels = c("WT", "MT"))
+ord_indx <- order(mat_col1$`Notch mutation status`)
+
+mt_count <- RColorBrewer::brewer.pal(9, "Greys")[1:length(unique(mat_col1$`Mutation count`))]
+names(mt_count) <- sort(unique(mat_col1$`Mutation count`))
+
+top_ann <- HeatmapAnnotation(df = mat_col1, col = list(
+  Histology = c("Normal" = "grey45",
+                "Hyperplasia" = "#3c68b0",
+                "Metaplasia" = "#F4AD31",
+                "Mild dysplasia" = "#FC9272",
+                "Moderate dysplasia" = "#FB6A4A",
+                "Severe dysplasia" = "#DE2D26"),
+  Outcome = c("regressive" = "#00796B", 'progressive' = "#FB8C00", "persistent" = "#cd7058",
+              "unknown" = "#E0E0E0", "stable" = "#B0BEC5"),
+  `Notch mutation status` = c(WT="orange",MT="purple"),
+  `Notch mutation type` =c (lof = "red3", splice.site = "#984EA3",
+                            missense = "#377EB8", none = "grey93"),
+  `Genomic smoking status` = c(Current = "#CD5C5C", Former = "#4169E1"),
+  `Molecular subtype` = c(Inflammatory = "#33A02C", Normal = "#B2DF8A", Proliferative = "#1F78B4", Secretory = "#A6CEE3"),
+  `Mutation count` = mt_count),
+  annotation_name_gp = gpar(fontsize = 4.5, fontface = "bold"), show_legend = F, simple_anno_size = unit(0.2, "cm"), annotation_name_side = "right")
+
+ht = Heatmap(normalized.data1, show_row_names = F,
+             col = colorRampPalette(c("navy","white","red"), space="rgb")(255), show_row_dend = F,
+             show_column_dend = F, show_column_names = F,
+             border = T, show_heatmap_legend = T, name = " ",   cluster_columns = F,
+             top_annotation = top_ann, width = ncol(normalized.data1)*unit(0.5, "mm"),
+             height = nrow(normalized.data1)*unit(0.1, "mm"),
+             heatmap_legend_param = list(at = c(-2, -1, 0, 1, 2),
+                                         legend_height = unit(0.75, "cm"),
+                                         grid_width = unit(0.2, "cm"), labels_gp = gpar(fontsize = 4.5)))
+
+hist <- Legend(labels = c("Normal", "Hyperplasia", "Metaplasia",
+                          "Mild Dysplasia", "Moderate Dysplasia", "Severe Dysplasia"),
+               legend_gp = gpar(fill = c("grey45", "#3c68b0", "#F4AD31", "#FC9272", "#FB6A4A", "#DE2D26")),
+               labels_gp = gpar(fontsize = 4.5),
+               title = "Histology",
+               grid_width = unit(2.5, "mm"),
+               grid_height = unit(0.5, "mm"),
+               title_position = "topleft",
+               title_gp = gpar(fontsize = 4.5, fontface = "bold"))
+
+out <- Legend(labels = c("unknown", "stable", "regressive", "progressive", "persistent"),
+              legend_gp = gpar(fill = c("#E0E0E0", "#B0BEC5","#00796B","#FB8C00","#cd7058")),
+              labels_gp = gpar(fontsize = 4.5),
+              title = "Outcome",
+              grid_width = unit(2.5, "mm"),
+              grid_height = unit(0.5, "mm"),
+              title_position = "topleft",
+              title_gp = gpar(fontsize = 4.5, fontface = "bold"))
+
+notch.mut.st <- Legend(labels = c("WT", "MT"),
+                       legend_gp = gpar(fill = c("orange", "purple")),
+                       labels_gp = gpar(fontsize = 4.5),
+                       title = "Notch mutation status",
+                       grid_width = unit(2.5, "mm"),
+                       grid_height = unit(0.5, "mm"),
+                       title_position = "topleft",
+                       title_gp = gpar(fontsize = 4.5, fontface = "bold"))
+
+notch.mut.ty <- Legend(
+  labels = c("Loss of Function", "Missense Mutation", "Splice Site", "None"),  # Legend labels
+  legend_gp = gpar(fill = c("red3", "#377EB8","#984EA3","grey93")),
+  labels_gp = gpar(fontsize = 4.5),
+  title = "Notch mutation type",
+  grid_width = unit(2.5, "mm"),
+  grid_height = unit(0.5, "mm"),
+  title_position = "topleft",
+  title_gp = gpar(fontsize = 4.5, fontface = "bold")
+)
+
+smoking <- Legend(labels = c("Current", "Former"),
+                  legend_gp = gpar(fill = c("#CD5C5C", "#4169E1")),
+                  labels_gp = gpar(fontsize = 4.5),
+                  title = "Genomic smoking status",
+                  grid_width = unit(2.5, "mm"),
+                  grid_height = unit(0.5, "mm"),
+                  title_position = "topleft",
+                  title_gp = gpar(fontsize = 4.5, fontface = "bold"))
+
+mut.count <- Legend(labels = unique(mat_col1$`Mutation count`),
+                    legend_gp = gpar(fill = RColorBrewer::brewer.pal(9, "Greys")[1:length(unique(mat_col1$`Mutation count`))]),
+                    labels_gp = gpar(fontsize = 4.5),
+                    title = "Mutation count",
+                    grid_width = unit(2.5, "mm"),
+                    grid_height = unit(0.5, "mm"),
+                    title_position = "topleft",
+                    title_gp = gpar(fontsize = 4.5, fontface = "bold"))
+
+mol.sub <- Legend(labels = c("Inflammatory", "Normal", "Proliferative", "Secretory"),
+                  legend_gp = gpar(fill = c("#33A02C", "#B2DF8A","#1F78B4", "#A6CEE3")),
+                  labels_gp = gpar(fontsize = 4.5),
+                  title = "Molecular Subtype",
+                  grid_width = unit(2.5, "mm"),
+                  grid_height = unit(0.5, "mm"),
+                  title_position = "topleft",
+                  title_gp = gpar(fontsize = 4.5, fontface = "bold"))
+
+lgd_list <- packLegend(out, hist, smoking, notch.mut.st, notch.mut.ty,mol.sub, mut.count, max_height = unit(5, "cm"),
+                       column_gap = unit(0.5, "cm"))
+draw(ht, annotation_legend_list = lgd_list)
+```
+
+### Helper Functions: GSVA Modeling and Plotting
+
+```{r gsva-helpers}
+run_gsva_model <- function(exprData, geneSets, design_full, design_reduced, pat_block, id_col){
+  gsva_param <- gsvaParam(
+    exprData = exprData,
+    geneSets = geneSets,
+    kcdf = "Gaussian",
+    minSize = 1, maxSize = 260, maxDiff = TRUE)
+  
+  gsva_results <- gsva(gsva_param, verbose = FALSE)
+  
+  # model 1: associations between gene sets and predictors (smoking, notch status),
+  # adjusting for technical covariates
+  dupcor <- duplicateCorrelation(gsva_results, design = design_full, block = pat_block)
+  fit <- lmFit(object = gsva_results, design = design_full, block = pat_block, correlation = dupcor$consensus.correlation)
+  fit <- eBayes(fit)
+  
+  smoking_coef <- match("smoking.statusCurrent", colnames(fit$coefficients))
+  notch_coef   <- match("notch.statusMT", colnames(fit$coefficients))
+  
+  # move rownames (feature IDs) into a leading column before returning
+  add_id_col <- function(tbl){
+    tbl[[id_col]] <- rownames(tbl)
+    tbl[, c(id_col, setdiff(colnames(tbl), id_col))]
+  }
+  
+  sig.result <- topTable(fit = fit, coef = c(smoking_coef, notch_coef),
+                         adjust.method = "fdr", number = nrow(gsva_results)) |>
+    filter(adj.P.Val < 0.05) |> add_id_col()
+  
+  smoking.only <- topTable(fit = fit, coef = smoking_coef,
+                           adjust.method = "fdr", number = nrow(gsva_results)) |>
+    filter(adj.P.Val < 0.05) |> add_id_col()
+  
+  notch.only <- topTable(fit = fit, coef = notch_coef,
+                         adjust.method = "fdr", number = nrow(gsva_results)) |>
+    filter(adj.P.Val < 0.05) |> add_id_col()
+  
+  # model 2: remove effects of technical covariates only, to visualize the underlying
+  # biological (smoking/notch) signal
+  dupcor.r <- duplicateCorrelation(gsva_results, design = design_reduced, block = pat_block)
+  fit.r <- lmFit(gsva_results, design = design_reduced, block = pat_block, correlation = dupcor.r$consensus.correlation)
+  fit.r <- eBayes(fit.r)
+  residuals <- residuals(fit.r, gsva_results)
+  
+  return(list(sig.result = sig.result, smoking.only = smoking.only, notch.only = notch.only, residuals = residuals))
+}
+
+plot_gsva_boxplot <- function(residuals, feature_labels, notch_status, smoking_status,
+                              smoking_only, notch_only, facet_col){
+  feature_ids <- names(feature_labels)
+  
+  bp.data <- data.frame(cbind(t(residuals), notch.status = notch_status, smoking.status = smoking_status))
+
+  bp.data$notch.status <- factor(bp.data$notch.status, labels = c("WT","MT"))
+  bp.data$smoking.status <- factor(bp.data$smoking.status, labels = c("Former","Current"))
+
+  bp.sub <- bp.data[, c(feature_ids, "notch.status", "smoking.status")]
+  
+  meltData <- reshape2::melt(bp.sub, id.vars = c("notch.status", "smoking.status"))
+  colnames(meltData)[colnames(meltData) == "variable"] <- facet_col
+  meltData[[facet_col]] <- factor(meltData[[facet_col]], levels = feature_ids)
+  
+  gs_labeller <- as_labeller(feature_labels)
+  
+  df <- data.frame(id = feature_ids,
+                   smoking_pval = paste("Smoking p_value:", format.pval(smoking_only[feature_ids,"adj.P.Val"], digits = 2)),
+                   notch_pval = paste("NOTCH1 p_value: ", format.pval(notch_only[feature_ids,"adj.P.Val"], digits = 2))) |>
+    tidyr::unite(p_value, smoking_pval:notch_pval, sep = "\n")
+  colnames(df)[colnames(df) == "id"] <- facet_col
+  
+  df$y_max <- meltData |> group_by(.data[[facet_col]]) |> summarise(y = max(value)) |> pull(y)
+  
+  facet_formula <- as.formula(paste0("~", facet_col))
+  
+  gbox <- ggboxplot(meltData, x = "smoking.status", y = "value", fill = "notch.status", outlier.shape = NA, lwd = 0.35) +
+    facet_wrap(facet_formula, scales = 'free', labeller = gs_labeller)  +
+    geom_point(aes(fill = notch.status), position = position_jitterdodge(jitter.width = 0.25, dodge.width = 0.75),
+               size = 0.15) +
+    theme_bw() +
+    theme(axis.ticks.x = element_line(linewidth = 0.25),
+          axis.text.x = element_text(size = 4, family = "Helvetica", color = "black"),
+          axis.title.x = element_text(size = 5, vjust = 2.5, family = "Helvetica"),
+          axis.ticks.y = element_line(linewidth = 0.25),
+          axis.text.y = element_text(size = 4, family = "Helvetica", color = "black"),
+          axis.title.y = element_text(size = 5, vjust = 2.5, family = "Helvetica"),
+          plot.title = element_text(size = 6, family = "Helvetica"),
+          strip.text = element_text(size = 5, family = "Helvetica", face = "bold"),
+          plot.margin = unit(c(0,0,0,0.25), "cm"),
+          strip.background = element_blank(),
+          legend.title = element_text(size = 5, face = "bold"),
+          legend.text = element_text(size = 4),
+          legend.key.size = unit(0.5,"cm"),
+          legend.position = "right", legend.box.spacing = unit(0, "pt"),
+          legend.margin=margin(0,0,0,0),
+          legend.spacing.x = unit(0.1, 'cm')) +
+    theme(
+      axis.line.x = element_line(linewidth = 0.3),
+      axis.line.y = element_line(linewidth = 0.3)
+    ) + theme( panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank()) +
+    scale_fill_manual(name = "NOTCH1 status",values=c("orange","purple")) +
+    xlab("Smoking Status") + ylab("GSVA Score")
+  
+  gbox +
+    geom_text(data = df,
+              mapping = aes(x = 1.5, y = y_max-0.1, label = p_value),
+              size = 1.2, hjust = 0.7, vjust = 0, color = "black", fontface = "italic")
+}
+```
+
+```{r gsva-design}
+model_data <- data.frame(colData(pcga.biopsy))
+model_data$smoking.status <- smoking.status
+model_data$notch.status <- notch.status
+
+design <- model.matrix(
+  ~ as.numeric(characteristics..median.TIN) +
+    as.character(characteristics..flowcell.ID) + smoking.status + notch.status,
+  data = model_data)
+
+design.r <- model.matrix(
+  ~ as.numeric(characteristics..median.TIN) +
+    as.character(characteristics..flowcell.ID),
+  data = model_data)
+
+pat.block <- as.factor(as.character(colData(pcga.biopsy)$characteristics..patient.ID))
+```
+
+### GSVA: Epithelial Cell Signatures
+
+```{r gsva-epithelial, fig.dpi=300, fig.cap="Figure 3H"}
+celda_modules <- readRDS(file.path(data_dir, "Grants_celda_modules.rds"))
+
+# CEACAM5   FOXJ1 SCGB1A1   KRT13    KRT5  MUC5AC
+# "L33"    "L9"   "L37"   "L28"    "L5"   "L31"
+
+epi <- run_gsva_model(exprData = data.cpm.filtered, geneSets = celda_modules$Ensembl_IDs,
+                      design_full = design, design_reduced = design.r, pat_block = pat.block,
+                      id_col = "Modules")
+# Figure 3h
+epi_labels <- c(L28 = "L28: Smoker Basal Cells\n(KRT13, SPRR1B)",
+                L31 = "L31: Goblet Cells (MUC5AC)",
+                L33 = "L33: Goblet/Peri-goblet cells\n(CEACAM5, CEACAM6)",
+                L37 = "L37: Club Cells (SCGB1A1)")
+
+g1 <- plot_gsva_boxplot(residuals = epi$residuals, feature_labels = epi_labels,
+                        notch_status = notch.status, smoking_status = smoking.status,
+                        smoking_only = epi$smoking.only, notch_only = epi$notch.only,
+                        facet_col = "modules")
+g1
+```
+
+### GSVA: Immune Cell Signatures
+
+```{r gsva-immune, fig.dpi=300, fig.cap="Figure 3I"}
+immune_signatures <- readRDS(file.path(data_dir, "immune_cell_signatures.rds"))
+
+imm <- run_gsva_model(exprData = data.cpm.filtered, geneSets = immune_signatures,
+                      design_full = design, design_reduced = design.r, pat_block = pat.block,
+                      id_col = "Immune cells")
+# figure 3i
+immune_labels <- c(B_cells = "B-Cells",
+                   T_cells = "T-Cells",
+                   Neutrophils = "Neutrophils",
+                   Th2_cells = "T Helper 2 (TH2) Cells")
+
+g2 <- plot_gsva_boxplot(residuals = imm$residuals, feature_labels = immune_labels,
+                        notch_status = notch.status, smoking_status = smoking.status,
+                        smoking_only = imm$smoking.only, notch_only = imm$notch.only,
+                        facet_col = "immune_cells")
+g2
+```
+
+### Session Information
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,916 @@
+---
+title: "Mutational Characterization"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  bookdown::html_document2:
+    css: styles.css
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### Libraries and Paths
+
+```{r libraries-paths}
+library(grid)
+library(glue)
+library(dplyr)
+library(musicatk)
+library(maftools)
+library(circlize)
+library(gridExtra)
+library(ComplexHeatmap)
+library(ggpubr)
+library(rstatix)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+library(readxl)
+library(tibble)
+library(data.table)
+library(writexl)
+library(ggpubr)
+source("/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Scripts/readData.R")
+
+data_dir <- "/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Data"
+```
+
+### Helper Functions
+
+```{r helpers}
+getMutTable <- function(maf, annotation, genes = driver_genes) {
+  mat = mutCountMatrix(maf, removeNonMutated = FALSE)
+  mat <- mat[rownames(mat) %in% genes, , drop = FALSE]
+  mat = mat %>%
+    t() %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "Tumor_Sample_Barcode")
+
+  for (gene in genes) {
+    if (!gene %in% colnames(mat)) {
+      mat[[gene]] <- 0
+    }
+  }
+
+  merge(
+    x = mat,
+    y = annotation[, c("Tumor_Sample_Barcode", "Histology")],
+    by = "Tumor_Sample_Barcode",
+    all.x = TRUE
+  )
+}
+
+get_histology_sample_ids <- function(annotation, histologies) {
+  setNames(
+    lapply(histologies, function(h) annotation$Tumor_Sample_Barcode[annotation$Histology == h]),
+    histologies
+  )
+}
+
+subset_maf_by_histology <- function(maf, sample_ids, genes = driver_genes) {
+  lapply(sample_ids, function(ids) {
+    subsetMaf(maf, genes = genes, tsb = ids)
+  })
+}
+
+get_sample_summary_df <- function(maf_list, cohort_sizes) {
+  dat <- purrr::imap_dfr(maf_list, function(maf, hist_name) {
+    sample_vars = getSampleSummary(maf)
+    with_drivers = nrow(sample_vars)
+    cohort_size = cohort_sizes[[hist_name]]
+    tibble(
+      Histology = hist_name,
+      percentage = round(with_drivers / cohort_size * 100),
+      with_drivers = with_drivers,
+      zero_drivers = cohort_size - with_drivers
+    )
+  })
+  dat
+}
+
+samples_with_genes <- function(maf, hist, samples) {
+  mat = data.frame(t(mutCountMatrix(maf)))
+  mat = mat |> mutate(across(everything(), ~ifelse(. > 0, 1, 0)))
+
+  x = mat |> 
+    rowSums() |>
+    data.frame() |>
+    rename(count = 1) |>
+    tibble::rownames_to_column(var = "Tumor_Sample_Barcode")
+
+  x = bind_rows(
+    x,
+    data.frame(
+      Tumor_Sample_Barcode = samples[!samples %in% x$Tumor_Sample_Barcode],
+      count = 0
+    )
+  )
+
+  x$Histology = hist
+  x
+}
+
+get_gene_mutation_table <- function(mut.dat, group_vec, gene_name, group_label) {
+  gene_hits = substring(subset(mut.dat, Hugo_Symbol == gene_name)$Tumor_Sample_Barcode, 1, 30)
+  gene_ix = names(group_vec) %in% gene_hits
+  table(gene_ix, group_vec == group_label)
+}
+
+get_gene_outcome_table <- function(mut.dat, outcome_vec, gene_name) {
+  gene_hits = substring(subset(mut.dat, Hugo_Symbol == gene_name)$Tumor_Sample_Barcode, 1, 30)
+  gene_ix = names(outcome_vec) %in% gene_hits
+  table(gene_ix, outcome_vec)
+}
+
+make_gene_barplot <- function(plot_df, stat_df, plot_title, y_headroom, p_headroom) {
+  ggplot(data = plot_df, aes(x = type, y = Frequency, fill = type)) +
+    geom_bar(stat = "identity", width = 0.7, alpha = 0.8) + 
+    scale_fill_manual(values = c("blue4", "red3")) +
+    guides(fill = "none") +
+    theme_classic() +
+    ylab("Fraction mutated") +
+    xlab("") + 
+    theme(
+      axis.text.x = element_text(size = 6, angle = 45, hjust = 1, family = "Helvetica", color = "black"), 
+      axis.text.y = element_text(size = 5, family = "Helvetica", color = "black"), 
+      axis.title.y = element_text(size = 6.5, vjust = 2.5, family = "Helvetica"), 
+      axis.ticks.x = element_line(linewidth = 0.25), 
+      axis.ticks.y = element_line(linewidth = 0.25),
+      plot.title = element_text(size = 6.5, family = "Helvetica", hjust = 0.5, vjust = 1, face = "italic"), 
+      plot.margin = unit(c(0, 0, -0.5, 0.25), "cm"),
+      axis.line.x = element_line(linewidth = 0.3),
+      axis.line.y = element_line(linewidth = 0.3)
+    ) +
+    ggtitle(plot_title) + 
+    scale_y_continuous(
+      limits = c(0, max(plot_df$Frequency) + y_headroom),
+      expand = c(0, 0)
+    ) +
+    stat_pvalue_manual(
+      data = stat_df,
+      label = "p = {p_val}",
+      y.position = max(plot_df$Frequency) + p_headroom,
+      size = 2,
+      inherit.aes = FALSE
+    )
+}
+
+plotTMBplot <- function(plot.dat, tmb.merge, wilcox.res, histology, logscale = TRUE) {
+  if (logscale) {
+    y_lims = c(-2, 2.3)
+    y_at = log10(c(0.01, 0.1, 1, 10, 100))
+  } else {
+    y_lims = range(data.table::rbindlist(l = plot.dat)[, total_perMB])
+    y_at = pretty(y_lims)
+  }
+
+  tmb.merge = data.frame(tmb.merge)
+  col = c("grey0", "black")
+  bg_col = c("white", "lightgrey")
+  medianCol = "red3"
+  cohortFontSize = 0.5
+  axisFontSize = 0.5
+
+  plot(NA, NA, xlim = c(0, length(histology)), ylim = y_lims, axes = FALSE, xlab = NA, ylab = NA, frame.plot = TRUE)
+  rect(par("usr")[1], par("usr")[3], par("usr")[2], par("usr")[4], col = grDevices::adjustcolor(col = "gray", alpha.f = 0.1))
+  rect(
+    xleft = seq(0, length(histology) - 1, 1),
+    ybottom = min(y_lims),
+    xright = seq(1, length(histology), 1),
+    ytop = max(y_lims) + 5,
+    col = grDevices::adjustcolor(col = bg_col, alpha.f = 0.2),
+    border = NA
+  )
+  abline(h = pretty(y_lims), lty = 2, col = "gray70")
+
+  lapply(seq_len(length(plot.dat)), function(i) {
+    x = plot.dat[[i]]
+    if (logscale) {
+      points(x$V1, log10(x$total_perMB), pch = 16, cex = 0.25, col = col[1])
+    } else {
+      points(x$V1, x$total_perMB, pch = 16, cex = 0.25, col = col[1])
+    }
+  })
+
+  axis(side = 1, at = seq(0.5, length(plot.dat) - 0.5, 1), labels = FALSE, tick = FALSE)
+  text(
+    x = seq(0.5, length(plot.dat) - 0.5, 1),
+    y = par("usr")[3] - 0.20,
+    labels = names(plot.dat),
+    srt = 45,
+    adj = 1,
+    xpd = TRUE,
+    cex = cohortFontSize
+  )
+
+  sidePos = 2
+  linePos = 2
+
+  if (logscale) {
+    axis(side = 2, at = y_at, las = 2, line = -0.6, tick = FALSE, labels = round(10^(y_at), 5), cex.axis = axisFontSize)
+  } else {
+    axis(side = 2, at = y_at, las = 2, line = -0.6, tick = FALSE, cex.axis = axisFontSize)
+  }
+  mtext(text = "Mutations per Megabase", side = sidePos, line = linePos, cex = 0.6)
+
+  if (logscale) {
+    tmb.merge$Median_Mutations_log10 <- log10(tmb.merge$Median_Mutations)
+    lapply(seq_len(nrow(tmb.merge)), function(i) {
+      segments(
+        x0 = i - 1, x1 = i,
+        y0 = tmb.merge[i, "Median_Mutations_log10"],
+        y1 = tmb.merge[i, "Median_Mutations_log10"],
+        col = medianCol, lwd = 1
+      )
+    })
+
+    text(
+      x = wilcox.res$group2 - 0.5,
+      y = wilcox.res$ypos,
+      labels = wilcox.res$p.adj.signif,
+      cex = 0.4,
+      xpd = TRUE
+    )
+
+    segments(
+      x0 = 1.5,
+      x1 = wilcox.res$group2 - 0.5,
+      y0 = wilcox.res$ypos - 0.1,
+      y1 = wilcox.res$ypos - 0.1,
+      lwd = 0.75
+    )
+
+    segments(
+      x0 = 1.5, x1 = 1.5,
+      y0 = wilcox.res$ypos - 0.15, y1 = wilcox.res$ypos - 0.1,
+      lwd = 0.75
+    )
+
+    segments(
+      x0 = wilcox.res$group2 - 0.5, x1 = wilcox.res$group2 - 0.5,
+      y0 = wilcox.res$ypos - 0.15, y1 = wilcox.res$ypos - 0.1,
+      lwd = 0.75
+    )
+  } else {
+    lapply(seq_len(nrow(tmb.merge)), function(i) {
+      segments(
+        x0 = i - 1, x1 = i,
+        y0 = tmb.merge[i, "Median_Mutations"],
+        y1 = tmb.merge[i, "Median_Mutations"],
+        col = medianCol
+      )
+    })
+  }
+}
+```
+
+### Load Input Data and Shared Objects
+
+```{r load-data}
+pcga.file <- read.delim(file.path(data_dir, "20200201_PCGA_Exome_with_MuTect2PON.maf"))
+pcga.file$Tumor_Sample_Barcode <- substr(pcga.file$Tumor_Sample_Barcode, 1, 30)
+pcga.annotations <- read_xlsx(file.path(data_dir, "20240802-PCGA-01-Metadata-New.xlsx"))
+pcga.annotations <- pcga.annotations[pcga.annotations$Tumor_Sample_Barcode %in% pcga.file$Tumor_Sample_Barcode,]
+
+cis.annotations <- read_xlsx(file.path(data_dir, "pheno.for.josh.xlsx"))
+cis.annotations <- cis.annotations |>
+  rename(Tumor_Sample_Barcode = Sample.Number..WGS.) |>
+  mutate(Histology = "CIS")
+
+cis.file <- read.delim(file.path(data_dir, "CIS_maftools.maf"), quote = "")
+
+tcga.data <- read.delim(
+  file.path(data_dir, "tcga.hg19.maf"),
+  sep = "\t",
+  quote = "",
+  fill = TRUE,
+  stringsAsFactors = FALSE
+)
+
+tcga.annotations <- data.frame(
+  Tumor_Sample_Barcode = unique(tcga.data$Tumor_Sample_Barcode),
+  Histology = "LUSC"
+)
+
+driver_genes <- read.table(file.path(data_dir, "lusc_genes.txt"))[, 1]
+
+pcga_histologies <- c("Brush", "Normal", "Hyperplasia", "Metaplasia", "Mild Dysplasia", "Moderate Dysplasia", "Severe Dysplasia")
+histology_no_brush <- c("Normal", "Hyperplasia", "Metaplasia", "Mild Dysplasia", "Moderate Dysplasia", "Severe Dysplasia", "CIS", "LUSC")
+histology_all <- c("Brush", histology_no_brush)
+outcome_levels <- c("stable", "regressive", "progressive", "persistent")
+
+histCols <- c("skyblue", "grey45", "#3c68b0", "#F4AD31", "#FC9272", "#FB6A4A", "#DE2D26")
+names(histCols) <- pcga_histologies
+
+histCols_no_brush <- c("grey45", "#3c68b0", "#F4AD31", "#FC9272", "#FB6A4A", "#DE2D26", "#7B2D3E", "#2E1410")
+names(histCols_no_brush) <- histology_no_brush
+
+histCols_all <- c("skyblue", histCols_no_brush)
+names(histCols_all) <- histology_all
+
+outcomeCols <- c("#E0E0E0", "#B0BEC5", "#00796B", "#FB8C00", "#cd7058")
+names(outcomeCols) <- c("unknown", "stable", "regressive", "progressive", "persistent")
+
+smoke.cols <- c("#4169E1", "#CD5C5C", "#F8F8FF")
+names(smoke.cols) <- c("Former", "Current", "NA")
+
+driver_variants <- c("Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation", "Splice_Site")
+signature_variants <- c("Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation", "Silent", "Splice_Site")
+
+pcga.maf_full <- ReadMaf(maf = pcga.file, metadata = pcga.annotations)
+
+pcga.maf_driver <- read.maf(pcga.file, clinicalData = pcga.annotations, vc_nonSyn = driver_variants)
+cis.maf_driver <- read.maf(cis.file, clinicalData = cis.annotations, vc_nonSyn = driver_variants)
+tcga.maf_driver <- read.maf(tcga.data, vc_nonSyn = driver_variants, clinicalData = tcga.annotations)
+
+pcga_sample_ids <- get_histology_sample_ids(pcga.annotations, pcga_histologies[pcga_histologies != 'Brush'])
+pcga_driver_mafs_by_histology <- subset_maf_by_histology(pcga.maf_driver, pcga_sample_ids, genes = driver_genes)
+names(pcga_driver_mafs_by_histology) <- pcga_histologies[pcga_histologies != 'Brush']
+
+cis.maf_driver_subset <- subsetMaf(cis.maf_driver, genes = driver_genes)
+tcga.maf_driver_subset <- subsetMaf(tcga.maf_driver, genes = driver_genes)
+
+cohort_sizes <- c(
+  Normal = 39,
+  Hyperplasia = 49,
+  Metaplasia = 21,
+  `Mild Dysplasia` = 17,
+  `Moderate Dysplasia` = 26,
+  `Severe Dysplasia` = 12,
+  CIS = 39,
+  LUSC = 473
+)
+
+update_geom_defaults("text", list(family = "Helvetica"))
+```
+
+### Somatic Mutational Landscape of PCGA
+
+```{r oncoplot, fig.width=8, fig.height=7, fig.dpi=300, fig.align='center', fig.cap="Figure 1B", out.width='100%', message=FALSE, warning=FALSE}
+nsamples <- length(unique(pcga.file$Tumor_Sample_Barcode))
+tmb_dat <- tmb(pcga.maf_full, captureSize = 30, plotType = NA) |> data.frame() |> select(c("Tumor_Sample_Barcode", "total_perMB"))
+colnames(tmb_dat) <- c("Tumor_Sample_Barcode", "Mutations per Mb")
+
+mut_count_mat <- maftools::mutCountMatrix(pcga.maf_full, removeNonMutated = FALSE)
+mut_count_mat <- ifelse(mut_count_mat > 0, 1, 0)
+
+gen_percent <- round(rowSums(mut_count_mat) / nsamples * 100)
+gen_percent <- gen_percent[gen_percent > 0]
+most_mut_genes <- names(gen_percent)[names(gen_percent) %in% driver_genes]
+
+annCols <- list(
+  Histology = histCols,
+  Outcome = outcomeCols,
+  Genomic_Smoking_Status = smoke.cols
+)
+
+vc_cols <- c(
+  RColorBrewer::brewer.pal(n = 12, name = "Paired"),
+  RColorBrewer::brewer.pal(n = 12, name = "Set3")[1]
+)
+names(vc_cols) <- unique(pcga.maf_full@data$Variant_Classification)
+
+oncoplot(
+  pcga.maf_full,
+  genes = most_mut_genes,
+  clinicalFeatures = c("Histology", "Outcome", "Genomic_Smoking_Status"),
+  sortByAnnotation = FALSE,
+  bgCol = "white",
+  showTitle = TRUE,
+  removeNonMutated = TRUE,
+  borderCol = "#EEEEEE",
+  annotationColor = annCols,
+  drawBox = TRUE,
+  gene_mar = 7,
+  topBarData = tmb_dat,
+  sepwd_genes = 1.5,
+  sepwd_samples = 1.5,
+  colors = vc_cols,
+  topBarLims = c(0, 8),
+  drawRowBar = FALSE,
+  anno_height = 0.75,
+  annotationFontSize = 0.6, 
+  legendFontSize = 0.6,
+  titleFontSize = 1, 
+  fontSize = 0.6
+)
+```
+
+### Percent of Samples With Driver Mutations
+
+```{r samples-with-drivers, fig.width=2, fig.height=2.5, fig.align='center', fig.dpi=300, fig.cap="Figure 1C", message=FALSE, warning=FALSE}
+driver_maf_list <- c(
+  pcga_driver_mafs_by_histology[histology_no_brush[histology_no_brush %in% names(pcga_driver_mafs_by_histology)]],
+  list(CIS = cis.maf_driver_subset, LUSC = tcga.maf_driver_subset)
+)
+
+driver_summary <- get_sample_summary_df(driver_maf_list, cohort_sizes)
+driver_summary$Histology <- factor(driver_summary$Histology, levels = histology_no_brush)
+
+mut <- as.matrix(driver_summary[, c("with_drivers", "zero_drivers")])
+rownames(mut) <- driver_summary$Histology
+ft <- fisher.test(mut, simulate.p.value = TRUE)
+p_label <- paste0("Fisher's exact test\np = ", signif(ft$p.value, 3))
+
+ggplot(driver_summary, aes(x = Histology, y = percentage, fill = Histology)) +
+  geom_col() +
+  coord_cartesian(ylim = c(0, 100)) +
+  annotate("text", x = Inf, y = Inf, label = p_label, size = 1, hjust = 1.1, vjust = 1.3) +
+  theme_bw() +
+  xlab("") +
+  ylab("% of samples with driver mutation") +
+  scale_fill_manual(values = histCols_no_brush) +
+  theme(
+    axis.text.x = element_text(size = 5, family = "Helvetica", color = "black", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 5, family = "Helvetica", color = "black"),
+    axis.title.y = element_text(size = 6, family = "Helvetica"),
+    legend.position = "none",
+    panel.grid = element_blank()
+  )
+```
+
+### Number of Driver Genes Mutated Per Sample
+
+```{r drivers-per-sample, fig.align='center', fig.width=2, fig.height=2.5, fig.dpi=300, fig.cap="Figure 1D", message=FALSE, warning=FALSE}
+norm.samp <- pcga_sample_ids[["Normal"]]
+hyper.samp <- pcga_sample_ids[["Hyperplasia"]]
+meta.samp <- pcga_sample_ids[["Metaplasia"]]
+mild.samp <- pcga_sample_ids[["Mild Dysplasia"]]
+mod.samp <- pcga_sample_ids[["Moderate Dysplasia"]]
+sev.samp <- pcga_sample_ids[["Severe Dysplasia"]]
+cis.samp <- unique(cis.file$Tumor_Sample_Barcode)
+tcga.samp <- unique(tcga.data$Tumor_Sample_Barcode)
+
+df_driver_counts <- bind_rows(
+  samples_with_genes(pcga_driver_mafs_by_histology[["Normal"]], "Normal", norm.samp),
+  samples_with_genes(pcga_driver_mafs_by_histology[["Hyperplasia"]], "Hyperplasia", hyper.samp),
+  samples_with_genes(pcga_driver_mafs_by_histology[["Metaplasia"]], "Metaplasia", meta.samp),
+  samples_with_genes(pcga_driver_mafs_by_histology[["Mild Dysplasia"]], "Mild Dysplasia", mild.samp),
+  samples_with_genes(pcga_driver_mafs_by_histology[["Moderate Dysplasia"]], "Moderate Dysplasia", mod.samp),
+  samples_with_genes(pcga_driver_mafs_by_histology[["Severe Dysplasia"]], "Severe Dysplasia", sev.samp),
+  samples_with_genes(cis.maf_driver_subset, "CIS", cis.samp),
+  samples_with_genes(tcga.maf_driver_subset, "LUSC", tcga.samp)
+)
+
+df_driver_counts$Histology <- factor(df_driver_counts$Histology, levels = histology_no_brush)
+kruskal_driver_counts <- kruskal.test(count ~ Histology, data = df_driver_counts)
+
+wilcox.res <- pairwise.wilcox.test(
+  x = df_driver_counts$count,
+  g = df_driver_counts$Histology,
+  p.adjust.method = "bonferroni",
+  exact = FALSE
+)[[3]]
+
+wilcox.res <- wilcox.res |>
+  data.frame() |>
+  rownames_to_column(var = "group2") |>
+  pivot_longer(cols = !group2, names_to = "group1", values_to = "p") |>
+  relocate(group1) |>
+  filter(!is.na(p)) |>
+  mutate(
+    p.signif = case_when(
+      p < 0.0001 ~ "****",
+      p < 0.001 ~ "***",
+      p < 0.01 ~ "**",
+      p < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+wilcox.res$group1 <- gsub("\\.", " ", wilcox.res$group1)
+wilcox.res <- wilcox.res %>%
+  add_xy_position(data = df_driver_counts, formula = count ~ Histology, x = "Histology")
+
+wilcox.res <- wilcox.res[, -5]
+y_max <- df_driver_counts |>
+  group_by(Histology) |>
+  summarise(y.position = max(count) + 1) |>
+  rename(group2 = Histology)
+
+wilcox.res <- merge(wilcox.res, y_max, by = "group2")
+
+ggplot(df_driver_counts, aes(x = Histology, y = count, fill = Histology)) +
+  geom_boxplot(outlier.size = 0.01, outlier.colour = "black", size = 0.3, lwd = 0.2) +
+  geom_jitter(size = 0.01, height = 0.02) +
+  theme_bw() +
+  xlab("") +
+  ylab("# driver genes mutated per sample") +
+  scale_y_continuous(breaks = c(0, 2, 4, 6, 8)) +
+  scale_fill_manual(values = histCols_no_brush) +
+  theme(
+    axis.text.x = element_text(size = 5, family = "Helvetica", color = "black", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 5, family = "Helvetica", color = "black"),
+    axis.title.y = element_text(size = 5, family = "Helvetica"),
+    legend.position = "none",
+    panel.grid = element_blank()
+  ) +
+  stat_pvalue_manual(
+    data = wilcox.res,
+    tip.length = 0.01,
+    xmin = "group1",
+    xmax = "group2",
+    label = "p.signif",
+    label.size = 1.5,
+    inherit.aes = FALSE,
+    hide.ns = TRUE
+  ) +
+  annotate(
+    geom = "text",
+    label = paste0("Kruskal-Wallis test p-value = ", format(kruskal_driver_counts$p.value, scientific = TRUE, digits = 2)), size = 1,
+    y = 8.5,
+    x = 4
+  )
+```
+
+### Mutation Frequencies of Driver Genes Across PCGA, CIS, and TCGA
+
+```{r mutation-freq, fig.width=4, fig.height=4,fig.align='center', fig.dpi=300, fig.cap="Figure 1E", message=FALSE, warning=FALSE}
+mut <- bind_rows(
+  getMutTable(pcga.maf_driver, pcga.annotations),
+  getMutTable(cis.maf_driver, cis.annotations),
+  getMutTable(tcga.maf_driver, tcga.annotations)
+)
+
+mut$Histology <- factor(mut$Histology, levels = histology_all)
+mut <- mut[!(is.na(mut$Histology)), ]
+
+set.seed(123)
+results <- list()
+for (i in seq_along(driver_genes)) {
+  mat = t(table(mut[driver_genes[i]] > 0, mut$Histology))
+  results[[driver_genes[i]]] <- fisher.test(mat, alternative = "greater", simulate.p.value = TRUE)$p.value
+}
+
+res.df <- tibble::enframe(results, name = "Genes", value = "p.value")
+res.df$p.value <- unlist(res.df$p.value)
+res.df$fdr <- p.adjust(res.df$p.value, method = "fdr")
+
+m <- mut %>%
+  pivot_longer(
+    cols = colnames(mut)[colnames(mut) %in% driver_genes],
+    names_to = "Genes",
+    values_to = "Mutation"
+  )
+
+m_long <- m %>%
+  group_by(Histology, Genes) %>%
+  summarize(Mutated = sum(Mutation != 0, na.rm = TRUE), .groups = "drop") %>%
+  filter(complete.cases(.))
+
+matx <- m_long %>% pivot_wider(names_from = "Histology", values_from = "Mutated")
+matx$highly_mut_genes <- rowSums(matx[, -1])
+matx <- matx[order(matx$highly_mut_genes, decreasing = TRUE), ]
+matx <- matx[, -11]
+
+gene.row <- matx$Genes
+matx <- matx[, histology_all]
+
+total_sizes <- data.frame(table(mut$Histology))[, 2]
+
+plot_data <- as.data.frame(mapply(function(x, y) x / y, matx, total_sizes)) * 100
+rownames(plot_data) <- gene.row
+plot_data <- plot_data[, -1]
+
+col_fun <- colorRamp2(c(0, 15, 75), c("white", "#F05039", "#1F449C"))
+plt <- Heatmap(
+  as.matrix(plot_data),
+  name = " ",
+  col = col_fun,
+  rect_gp = gpar(col = "lightgrey", lwd = 0.25),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  heatmap_legend_param = list(
+    at = c(0, 15, 30, 75),
+    legend_height = unit(1.5, "cm"),
+    grid_width = unit(0.25, "cm"),
+    labels_gp = gpar(fontsize = 5)
+  ),
+  column_order = names(plot_data),
+  row_order = rownames(plot_data),
+  row_names_gp = gpar(fontsize = 6, fontfamily = "Helvetica", fontface = "italic"),
+  row_names_side = "left",
+  column_names_rot = 45,
+  column_names_gp = gpar(fontsize = 6, fontfamily = "Helvetica")
+)
+
+heatmap <- grid.grabExpr(draw(plt, heatmap_legend_side = "left"))
+
+res.df <- res.df %>%
+  mutate(Genes = factor(Genes, levels = gene.row)) %>%
+  arrange(Genes) %>%
+  as.data.frame()
+
+rownames(res.df) <- c(25:1)
+cutoff <- -log10(0.05)
+
+bp <- res.df %>%
+  ggplot(aes(x = forcats::fct_reorder(Genes, as.numeric(rownames(res.df))), y = -log10(fdr))) +
+  geom_col(fill = "grey45", width = 0.75) +
+  coord_flip() +
+  theme_classic() +
+  geom_errorbar(aes(ymin = 0, ymax = 0), width = 0.75, color = "grey45", lwd = 0.5) +
+  xlab("") +
+  ylab("-log10(q-value)") +
+  geom_hline(yintercept = cutoff, linetype = "dashed", color = "red", lwd = 0.5) +
+  theme(
+    axis.text.x = element_text(family = "Helvetica", size = 6, colour = "black"),
+    axis.title.x = element_text(family = "Helvetica", size = 6),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank()
+  )
+
+grid.arrange(
+  heatmap,
+  bp,
+  ncol = 2,
+  widths = unit(c(1, 1), "null"),
+  heights = unit(c(1), "null"),
+  padding = unit(0.1, "cm")
+)
+```
+
+### NOTCH1 in Dysplasia vs Low-Grade Lesions
+
+```{r dys-vs-lowgrade, fig.width=2.5, fig.height=2, fig.align='center', fig.dpi=300, fig.cap="Figure 1F", message=FALSE, warning=FALSE}
+mut.dat <- pcga.maf_full@data
+pcga.clinc <- pcga.maf_full@clinical.data
+
+histology_grouped <- setNames(pcga.clinc$Histology, pcga.clinc$Tumor_Sample_Barcode)
+histology_grouped[histology_grouped %in% c("Severe Dysplasia", "Moderate Dysplasia", "Mild Dysplasia")] <- "Dysplasia"
+
+notch1_dys <- get_gene_mutation_table(mut.dat, histology_grouped, "NOTCH1", "Dysplasia")
+tp53_dys <- get_gene_mutation_table(mut.dat, histology_grouped, "TP53", "Dysplasia")
+
+stat1 <- data.frame(group1 = "Other", group2 = "Dysplasia", p_val = round(fisher.test(notch1_dys, alternative = "greater")$p.value, 3))
+stat2 <- data.frame(group1 = "Other", group2 = "Dysplasia", p_val = round(fisher.test(tp53_dys, alternative = "greater")$p.value, 3))
+
+plt1 <- data.frame(type = c("Other", "Dysplasia"), Frequency = c(t(prop.table(notch1_dys, 2)[2, ])[[1]], t(prop.table(notch1_dys, 2)[2, ])[[2]]))
+plt1$type <- factor(plt1$type, levels = c("Other", "Dysplasia"))
+
+plt2 <- data.frame(type = c("Other", "Dysplasia"), Frequency = c(t(prop.table(tp53_dys, 2)[2, ])[[1]], t(prop.table(tp53_dys, 2)[2, ])[[2]]))
+plt2$type <- factor(plt2$type, levels = c("Other", "Dysplasia"))
+
+notch1.barplot <- make_gene_barplot(plt1, stat1, "NOTCH1", 0.04, 0.02)
+tp53.barplot <- make_gene_barplot(plt2, stat2, "TP53", 0.02, 0.01)
+
+ggarrange(notch1.barplot, tp53.barplot, ncol = 2, nrow = 1)
+```
+
+### NOTCH1 Mutations by Lesion Outcome
+
+```{r mutation-by-outcome, fig.width=3, fig.height=2, fig.align='center', fig.dpi=300, fig.cap="Figure 1G", message=FALSE, warning=FALSE}
+pcga.clinc_outcome <- pcga.maf_full@clinical.data
+pcga.clinc_outcome <- pcga.clinc_outcome[pcga.clinc_outcome$Outcome != "unknown", ]
+outcome <- setNames(pcga.clinc_outcome$Outcome, pcga.clinc_outcome$Tumor_Sample_Barcode)
+
+notch1_outcome <- get_gene_outcome_table(mut.dat, outcome, "NOTCH1")
+tp53_outcome <- get_gene_outcome_table(mut.dat, outcome, "TP53")
+
+plt1 <- data.frame(t(prop.table(notch1_outcome, 2)[2, ])) |>
+  pivot_longer(cols = everything(), names_to = "outcome", values_to = "Frequency") |>
+  mutate(gene = "NOTCH1")
+
+plt2 <- data.frame(t(prop.table(tp53_outcome, 2)[2, ])) |>
+  pivot_longer(cols = everything(), names_to = "outcome", values_to = "Frequency") |>
+  mutate(gene = "TP53")
+
+df <- bind_rows(plt1, plt2)
+df$outcome <- factor(df$outcome, levels = outcome_levels)
+
+stat <- data.frame(
+  gene = c("NOTCH1", "TP53"),
+  pVal = c(
+    fisher_test(notch1_outcome, alternative = "greater")$p,
+    fisher_test(tp53_outcome, alternative = "greater")$p
+  )
+)
+ggplot(df, aes(x = outcome, y = Frequency, fill = outcome)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  geom_text(
+    data = stat,
+    mapping = aes(x = 0.5, y = 0.45, label = paste0("p=", pVal)),
+    size = 2,
+    hjust = -0.1,
+    vjust = 0,
+    inherit.aes = FALSE
+  ) +
+  facet_grid(~gene, scales = "free_y") +
+  theme_classic() +
+  scale_fill_manual(values = c("#B0BEC5", "#00796B", "#FB8C00", "#cd7058")) +
+  ylab("Fraction mutated") +
+  xlab("") +
+  theme(
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.y = element_line(linewidth = 0.25),
+    axis.text.y = element_text(size = 6, family = "Helvetica", color = "black"),
+    axis.title.y = element_text(size = 6, vjust = 2.5, family = "Helvetica"),
+    plot.title = element_text(size = 6, family = "Helvetica"),
+    strip.text = element_text(size = 6, family = "Helvetica", face = "italic"),
+    plot.margin = unit(c(0, 0, 0, 0.25), "cm"),
+    strip.background = element_blank(),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 4),
+    legend.key.size = unit(0.2, "cm"),
+    legend.position = "bottom",
+    legend.box.spacing = unit(0, "pt"),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.spacing.x = unit(0.1, "cm"),
+    axis.line.x = element_line(linewidth = 0.3),
+    axis.line.y = element_line(linewidth = 0.3)
+  ) +
+  guides(fill = guide_legend(nrow = 1)) +
+  geom_errorbar(aes(ymin = 0, ymax = 0, color = outcome), width = 0.7, show.legend = FALSE) +
+  scale_color_manual(values = c("#B0BEC5", "#00796B", "#FB8C00", "#cd7058"))
+```
+
+### Tumor Mutation Burden
+
+```{r TMB, fig.width=4, fig.height=4.5, fig.dpi=300, fig.align='center', fig.cap="Figure 1H", message=FALSE, warning=FALSE}
+tmb_list <- list()
+exome.clinic <- getClinicalData(pcga.maf_driver)
+
+for (hist in pcga_histologies) {
+  sample_ids <- exome.clinic[Histology %in% hist, Tumor_Sample_Barcode]
+  sub.maf <- subsetMaf(pcga.maf_driver, tsb = sample_ids, verbose = FALSE)
+  tmb_list[[hist]] <- tmb(sub.maf, captureSize = 30, plotType = NA, verbose = FALSE)
+}
+
+tmb_list[["LUSC"]] <- tmb(tcga.maf_driver, captureSize = 30, plotType = NA, verbose = FALSE)
+tmb_list[["CIS"]] <- tmb(cis.maf_driver, captureSize = 30, plotType = NA, verbose = FALSE)
+
+for (i in seq_along(tmb_list)) {
+  tmb_list[[i]]$Histology <- names(tmb_list[i])
+}
+
+mutation_load <- do.call(rbind, tmb_list) %>% select(c(5, 3))
+
+wilcox.res <- mutation_load |>
+  wilcox_test(total_perMB ~ Histology, ref.group = "Normal", p.adjust.method = "bonferroni")
+
+wilcox.res$ypos <- c(1.0, 2.2, 1.2, 2.4, 1.4, 1.6, 1.8, 2.0)
+wilcox.res$group2 <- as.numeric(factor(wilcox.res$group2, levels = unique(histology_all)))
+
+median <- mutation_load %>% group_by(Histology) %>% summarise(Median_Mutations = median(total_perMB))
+tmb.merge <- merge(data.frame(table(mutation_load[, 1])), median, by.x = "Histology", by.y = "Histology")
+tmb.merge <- tmb.merge[match(histology_all, tmb.merge$Histology), ]
+colnames(tmb.merge) <- c("Histology", "Cohort_Size", "Median_Mutations")
+
+cohort.dat <- split(mutation_load, as.factor(mutation_load$Histology))
+cohort.dat <- cohort.dat[histology_all]
+
+plot.dat <- lapply(seq_len(length(cohort.dat)), function(i) {
+  x = cohort.dat[[i]]
+  data.table(
+    rev(seq(i - 1, i, length.out = nrow(x))),
+    x[order(x$total_perMB, decreasing = TRUE), "total_perMB"],
+    x[, "Histology"]
+  )
+})
+
+names(plot.dat) <- histology_all
+plotTMBplot(plot.dat, tmb.merge, wilcox.res, histology_all, TRUE)
+```
+
+### Mutation Signature Analysis
+
+```{r signature-analysis, fig.width=4.25, fig.height=2.5, fig.dpi=300, fig.cap="Figure 1I",fig.align='center', message=FALSE, warning=FALSE}
+pcga.sub.file <- pcga.file[pcga.file$Variant_Classification %in% signature_variants, ]
+cis.sub.file <- cis.file[cis.file$Variant_Classification %in% signature_variants, ]
+tcga.sub.data <- tcga.data[tcga.data$Variant_Classification %in% signature_variants, ]
+
+pcga.maf_signature <- read.maf(pcga.sub.file, clinicalData = pcga.annotations)
+pcga_variants <- extract_variants_from_maf(pcga.maf_signature)
+pcga_variants$chr <- paste0("chr", pcga_variants$chr)
+
+cis.maf_signature <- read.maf(cis.sub.file, clinicalData = cis.annotations)
+cis_variants <- extract_variants_from_maf(cis.maf_signature)
+cis_variants$chr <- paste0("chr", cis_variants$chr)
+
+tcga.maf_signature <- read.maf(tcga.sub.data, clinicalData = tcga.annotations)
+tcga_variants <- extract_variants_from_maf(tcga.maf_signature)
+tcga_variants$chr <- paste0("chr", tcga_variants$chr)
+
+variants <- rbind(pcga_variants, cis_variants, tcga_variants)
+
+annotations <- getClinicalData(pcga.maf_signature) %>% select(Tumor_Sample_Barcode, Histology)
+comb_annot <- rbind(
+  annotations,
+  cis.annotations[, c("Tumor_Sample_Barcode", "Histology")],
+  tcga.annotations
+)
+names(comb_annot) <- c("sample", "condition")
+
+hg19 <- select_genome("hg19")
+music.obj <- create_musica(variants, g = hg19, convert_dbs = FALSE)
+
+samples <- droplevels(music.obj@sample_annotations)
+samples <- as.vector(samples$Samples)
+comb_annot <- comb_annot[match(samples, comb_annot$sample), ]
+
+samp_annot(music.obj, "condition") <- comb_annot$condition
+build_standard_table(musica = music.obj, g = hg19, table_name = "SBS96")
+
+music.sub <- subset_musica_by_counts(musica = music.obj, table_name = "SBS96", num_counts = 10)
+
+data("cosmic_v2_sigs")
+
+result_pred_cosmic <- predict_exposure(
+  musica = music.sub,
+  table_name = "SBS96",
+  signature_res = cosmic_v2_sigs,
+  algorithm = "lda",
+  signatures_to_use = c(1, 2, 4, 5, 13)
+)
+
+mut.counts <- result_pred_cosmic@exposures
+mut.counts <- data.frame(t(mut.counts)) |>
+  tibble::rownames_to_column(var = "Samples") |>
+  pivot_longer(cols = !"Samples", names_to = "signature", values_to = "count")
+
+mut.counts.dt <- merge(mut.counts, result_pred_cosmic@musica@sample_annotations, by = "Samples", all.x = TRUE)
+wilcox.res <- mut.counts.dt |>
+  group_by(signature) |>
+  wilcox_test(count ~ condition, ref.group = "Normal", p.adjust.method = "bonferroni") |>
+  add_xy_position(x = "condition")
+
+exposures <- result_pred_cosmic@exposures
+exposures <- sweep(exposures, 2, colSums(exposures), FUN = "/")
+expos.frac <- exposures %>% t() %>% data.frame() %>% tibble::rownames_to_column(var = "Samples")
+expos.frac <- expos.frac %>% pivot_longer(!Samples, names_to = "signature", values_to = "exposure")
+expos.frac <- merge(expos.frac, result_pred_cosmic@musica@sample_annotations, by = "Samples", all.x = TRUE)
+expos.frac$condition <- factor(expos.frac$condition, levels = histology_no_brush)
+
+y_pos <- expos.frac %>%
+  group_by(signature, condition) %>%
+  summarise(ymax = max(exposure) + 0.1, .groups = "drop") %>%
+  rename(group2 = condition)
+
+wilcox.res <- left_join(wilcox.res, y_pos, by = c("signature", "group2")) |>
+  select(!y.position) |>
+  rename(y.position = ymax)
+
+selected_signatures <- c("SBS4", "SBS2", "SBS13")
+wilcox.res <- wilcox.res |> filter(signature %in% selected_signatures)
+expos.frac <- expos.frac[expos.frac$signature %in% wilcox.res$signature, ]
+
+expos.frac$signature <- factor(expos.frac$signature, levels = selected_signatures)
+wilcox.res$signature <- factor(wilcox.res$signature, levels = selected_signatures)
+
+ggplot(expos.frac, aes(x = condition, y = exposure, fill = condition)) +
+  geom_boxplot(outlier.size = 0.05, fatten = 0.5, lwd = 0.25, show.legend = FALSE) +
+  geom_point(aes(fill = condition), shape = 22, size = 0, colour = NA) +
+  scale_fill_manual(values = histCols_no_brush) +
+  facet_wrap(. ~ signature, nrow = 1, strip.position = "top", scales = "free_y") +
+  theme_bw() +
+  ylab("Exposure fractions") +
+  theme(axis.text.x = element_blank()) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size = 5, family = "Helvetica", color = "black"),
+    axis.title.y = element_text(size = 6, family = "Helvetica"),
+    legend.text = element_text(size = 4, family = "Helvetica"),
+    legend.key.size = unit(0.3, "cm"),
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0.5, vjust = 1, size = 6, family = "Helvetica"),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 6, family = "Helvetica", colour = "black"),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    legend.spacing.x = unit(1, "cm"),
+    legend.key.height = unit(0.1, "cm"),
+    legend.key.width = unit(0.15, "cm"),
+    legend.key.spacing.y = unit(0.05, "cm"),
+    panel.background = element_blank(),
+    panel.border = element_rect(linewidth = 0.5),
+    panel.grid = element_blank(),
+    plot.margin = unit(c(0.25, 0.25, 0.25, 0.25), "cm")
+  ) +
+  guides(fill = guide_legend(nrow = 2, override.aes = list(shape = 22, size = 4))) +
+  labs(title = "Mutation signature analysis across three cohorts") +
+  stat_pvalue_manual(
+    data = wilcox.res,
+    tip.length = 0.01,
+    xmin = "group1",
+    xmax = "group2",
+    label = "p.adj.signif",
+    label.size = 2,
+    inherit.aes = FALSE,
+    hide.ns = TRUE
+)
+```
+
+### Session Information
+
+```{r}
+sessionInfo()
+```

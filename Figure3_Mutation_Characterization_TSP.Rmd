@@ -1,0 +1,308 @@
+---
+title: "Targeted Data Mutation Characterization"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  bookdown::html_document2:
+    css: styles.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### Libraries and Paths
+
+```{r}
+library(grid)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readxl)
+library(ggpubr)
+library(rstatix)
+library(ggplot2)
+library(maftools)
+library(ggbeeswarm)
+library(ggrepel)
+source("/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Scripts/readData.R")
+
+data_dir <- "/restricted/projectnb/pcga/DNA_Seq_Combined_Analysis/Project/Data"
+```
+
+### Load Input Data
+
+```{r load-data}
+pcga.annotations <- read_xlsx(file.path(data_dir, "20240802-PCGA-01-Metadata-New.xlsx"))
+target.dat <- read.delim(file.path(data_dir, "20250810_PCGA_Targeted_with_MuTect2PON.maf"))
+# "PCGA-01-0049-086-23043-01185BR" is missing from the maf file as this sample did not have any mutation
+targeted.samples <- c("PCGA-01-0049-086-23043-01185BR", unique(target.dat$Tumor_Sample_Barcode))
+pcga.annotations <- pcga.annotations[pcga.annotations$Tumor_Sample_Barcode %in% targeted.samples,]
+
+target.maf <- ReadMaf(maf = target.dat, metadata = pcga.annotations)
+driver_genes <- read.table(file.path(data_dir, "lusc_genes.txt"))[,1]
+# TCGA-data
+tcga.data <- read.delim(file.path(data_dir, "tcga.hg19.maf"), 
+                        sep = "\t", quote = "", fill = TRUE, 
+                        stringsAsFactors = FALSE)
+
+tcga.maf <- ReadMaf(tcga.data, NULL)
+```
+
+### Data Stratification
+
+```{r stratify-data}
+brush.samples <- target.dat |> dplyr::pull(Tumor_Sample_Barcode) |> 
+  stringr::str_extract_all(pattern = "^PCGA-[0-9,-]+BR$") |>
+  unlist() |> unique()
+
+biopsy = target.dat[! target.dat$Tumor_Sample_Barcode %in% brush.samples,]
+brush = target.dat[target.dat$Tumor_Sample_Barcode %in% brush.samples,]
+
+biopsy.maf <- ReadMaf(biopsy, pcga.annotations)
+brush.maf <- ReadMaf(brush, pcga.annotations)
+
+hist_cat <- c("Normal", "Hyperplasia", "Metaplasia", "Mild Dysplasia", "Moderate Dysplasia", "Severe Dysplasia")
+# genes mutated in 10% or more biopsies
+biopsy.genes <- getGeneSummary(biopsy.maf)
+biopsy.genes$percent <- round(biopsy.genes$MutatedSamples/131 * 100) # n biopsies: 131
+biopsy.genes <- biopsy.genes$Hugo_Symbol[biopsy.genes$percent >= 10]
+# genes mutated in 8% or more brushes
+brush.genes <- getGeneSummary(brush.maf)
+brush.genes$percent <- round(brush.genes$MutatedSamples/45 * 100) # n brushes: 45
+brush.genes <- brush.genes$Hugo_Symbol[brush.genes$percent >= 8]
+```
+
+### Targeted Mutational Landscape
+
+```{r biopsies-oncoplot, fig.width=6, fig.height=3, fig.dpi=300, fig.align='center', fig.cap="Figure 3A", out.width='100%', message=FALSE, warning=FALSE}
+histCols = c("grey45","#3c68b0", "#F4AD31", "#FC9272", "#FB6A4A", "#DE2D26")
+names(histCols) = hist_cat
+
+outcomeCols = c("#B0BEC5","#00796B","#FB8C00","#cd7058", "#E0E0E0")
+names(outcomeCols) = c("stable", "regressive", "progressive", "persistent","unknown")
+
+smoke.cols <- c("#4169E1","#CD5C5C","#F8F8FF")
+names(smoke.cols) <- c("Former", "Current", "NA")
+annCols = list(Histology = histCols, Outcome = outcomeCols, Genomic_Smoking_Status = smoke.cols)
+
+vars <- c( "Frame_Shift_Del", "Missense_Mutation", "Frame_Shift_Ins", "Multi_Hit",       
+           "Nonsense_Mutation", "In_Frame_Del", "Splice_Site", "Start_Codon_Ins",
+         "De_novo_Start_OutOfFrame")
+vc_cols = c(RColorBrewer::brewer.pal(n = length(vars)+1, name = 'Paired')[-5])
+names(vc_cols) = vars
+
+oncoplot(biopsy.maf, cohortSize = 131, genes = biopsy.genes, drawRowBar = F,
+           bgCol = "white",borderCol = "#EEEEEE", removeNonMutated = T, drawColBar = F,
+           clinicalFeatures = c("Histology", "Outcome", "Genomic_Smoking_Status"),
+           annotationColor = annCols, colors = vc_cols, gene_mar = 6, 
+           legend_height = 2, annotationFontSize = 0.6, legendFontSize = 0.6,
+           titleFontSize = 1, fontSize = 0.6)
+```
+
+```{r brushes-oncoplot, fig.width=5, fig.height=2.5, fig.dpi=300, fig.align='center', fig.cap="Figure 3B", message=FALSE, warning=FALSE}
+oncoplot(brush.maf, cohortSize = 45, genes = brush.genes, drawRowBar = F,
+         bgCol = "white",borderCol = "#EEEEEE", removeNonMutated = T, 
+         clinicalFeatures = "Genomic_Smoking_Status", drawColBar = F,
+         annotationColor = annCols, colors = vc_cols, gene_mar = 6, 
+         legend_height = 2, annotationFontSize = 0.6, legendFontSize = 0.6,
+         titleFontSize = 1, fontSize = 0.6)
+```
+
+```{r plotting-theme}
+update_geom_defaults("text", list(size = 2, family = "Helvetica"))
+theme_pcga <- function(angle){
+  theme(axis.text.x = element_text(size = 6, family = "Helvetica", color = "black", angle = angle, hjust = 1), 
+        axis.text.y = element_text(size = 6, family = "Helvetica", color = "black"), 
+        axis.title.x = element_text(size = 6, family = "Helvetica", color = "black"), 
+        axis.title.y = element_text(size = 6, family = "Helvetica", color = "black"), 
+        axis.ticks.x = element_line(linewidth = 0.25), 
+        axis.ticks.y = element_line(linewidth = 0.25),
+        axis.line.x = element_line(linewidth = 0.3),
+        axis.line.y = element_line(linewidth = 0.3),
+        panel.grid = element_blank()
+  )
+}
+```
+
+### Brush vs Dysplastic Biopsies
+
+```{r brush-vs-dysplasia, fig.align='center', fig.width=3, fig.height=2, fig.dpi=300, fig.cap="Figure 3C", message=FALSE, warning=FALSE}
+dysplasia <- c("Mild Dysplasia", "Moderate Dysplasia", "Severe Dysplasia")
+annot <- pcga.annotations |> mutate(Histology = ifelse(Histology %in% dysplasia, "Dysplasia", Histology))
+
+biopsy.df <- coding.maf(biopsy)
+brush.df <- coding.maf(brush)
+genes <- intersect(biopsy.df$Hugo_Symbol, brush.df$Hugo_Symbol)
+histology <- setNames(annot$Histology,annot$Tumor_Sample_Barcode)
+
+mutation_fraction <- function(df, genes, histology, label, truncate_barcode = FALSE) {
+  map_dfr(genes, function(gene) {
+    mut_dat <- subset(df, Hugo_Symbol == gene)$Tumor_Sample_Barcode
+    if (truncate_barcode) mut_dat <- substring(mut_dat, 1, 30)
+    gene.ix <- names(histology) %in% mut_dat
+    gene_dys <- table(gene.ix, histology == label)
+    data.frame(Gene = gene, Mutation = t(prop.table(gene_dys, 2)[2, ])[2])
+  })
+}
+
+df1 <- bind_rows(
+  mutation_fraction(biopsy.df, genes, histology, "Dysplasia", truncate_barcode = TRUE) |> mutate(SampleType = "Dysplasia"),
+  mutation_fraction(brush.df, genes, histology, "Brush", truncate_barcode = TRUE) |> mutate(SampleType = "Brush")
+)
+
+df1 <- df1 |> pivot_wider(names_from = SampleType, values_from = Mutation)
+# remove genes that are not mutated at all in brush or dysplasia
+new.df <- df1[apply(df1 != 0, 1, all), ]
+
+# Fisher test 
+hist_edt <- histology[! histology %in% c("Hyperplasia", "Metaplasia", "Normal")]
+target.df <- coding.maf(target.dat)
+res <- list()
+
+for (gene in genes) {
+  mut_dat <- subset(target.df, Hugo_Symbol == gene) |> pull("Tumor_Sample_Barcode")
+  gene.ix = names(hist_edt) %in% mut_dat
+  gene_dys <- table(gene.ix, hist_edt == "Dysplasia")
+  res[[gene]] <- fisher.test(gene_dys)$p
+}
+
+res.df <- tibble::enframe(res) 
+res.df$value <- unlist(res.df$value)
+res.df <- res.df |> mutate(p.adj = p.adjust(res.df$value, method = "BH"))
+
+ggplot(data = new.df, aes(x = Dysplasia, y = Brush, label = Gene)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_point(size = 0.35, color = 'blue') + ylim(0,0.65) + xlim(0,0.65) +
+  geom_text_repel(aes(label = Gene),
+                  seed = 1, size = 1.5,
+                  fontface = "italic",
+                  box.padding = 0.4, point.padding = 0.2,
+                  segment.size = 0.3, segment.alpha = 0.5,
+                  max.overlaps = Inf) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 12) +
+  theme(plot.margin = margin(5.5, 40, 5.5, 5.5)) +
+  ylab("Fraction mutated in airway brushes") + xlab("Fraction mutated in dysplastic biopsies") +
+  theme_pcga(angle = 0)
+```
+
+### NOTCH1 Mutation Spectrum
+
+```{r lollipop-plot, fig.align='center', fig.width=3, fig.height=2, fig.dpi=300, fig.cap="Figure 3D", message=FALSE, warning=FALSE}
+plot_lollipop <- function(maf, sample_label){
+  lollipopPlot(
+    maf = maf,
+    gene = "NOTCH1",
+    AACol = "Protein_Change",
+    pointSize = 0.8,
+    legendTxtSize = 0.3,
+    axisTextSize = c(0.3,0.3),
+    labPosSize = 0.3,
+    titleSize = c(0.5,0.8),
+    cBioPortal = TRUE,
+    showDomainLabel = FALSE,
+    showMutationRate = TRUE,
+    collapsePosLabel = FALSE
+  )
+  mtext(sample_label, side = 3, line = 0.2, adj = 0, cex = 0.5)
+}
+
+plot_lollipop(brush.maf, "Brush")
+plot_lollipop(biopsy.maf, "Biopsy")
+plot_lollipop(tcga.maf, "TCGA")
+```
+
+### Number of NOTCH1 Mutations Across Histologies
+
+```{r notch1-mutations, fig.align='center', fig.width=4, fig.height=3, fig.dpi=300, fig.cap="Figure 3E", message=FALSE, warning=FALSE}
+mut = target.df |> 
+  filter(Hugo_Symbol == "NOTCH1") |> 
+  group_by(Tumor_Sample_Barcode) |> 
+  summarise(Mutation = n())
+m = left_join(annot[,c("Tumor_Sample_Barcode", "Histology")], mut, by = "Tumor_Sample_Barcode")
+m[is.na(m)] <- 0
+m$Histology <- factor(m$Histology, levels = c("Brush", "Normal", "Hyperplasia", "Metaplasia", "Dysplasia"))
+
+avg_mut <- m |>
+  group_by(Histology) |>
+  summarise(AverageMutations = mean(Mutation))
+
+wilcox.res <- m |>
+  wilcox_test(Mutation ~ Histology,
+              ref.group = "Dysplasia",
+              p.adjust.method = "bonferroni") |>
+  add_xy_position(x = "Histology")
+ggplot(m, aes(x = Histology, y = Mutation, color = Histology, fill = Histology)) + 
+  geom_boxplot(size = 0.25, outlier.size = 0.25, fatten = 0.5, alpha = 0.6)+ geom_jitter(size = 0.25) +
+  scale_color_manual(values = c("skyblue","grey45","#3c68b0","#F4AD31","#DE2D26")) +
+  scale_fill_manual(values = c("skyblue","grey45","#3c68b0","#F4AD31","#DE2D26")) +
+  geom_line(data = avg_mut, aes(x = Histology, y = AverageMutations, group = 1),
+            color = "red", linetype = "dashed", lwd = 0.35) + theme_bw() + 
+  ylab("Number of NOTCH1 Mutations") + 
+  xlab("") + theme_pcga(angle = 45) +
+  stat_pvalue_manual(data = wilcox.res, label = "p.adj.signif", size = 2,
+                     tip.length = 0.02, xmin = "group1", xmax = "group2",
+                     inherit.aes = FALSE, hide.ns = TRUE)
+```
+
+### Distribution of NOTCH1 VAFs Across Histologies
+
+```{r notch1-vaf, fig.align='center', fig.width=2, fig.height=2, fig.dpi=300, fig.cap="Figure 3F", message=FALSE, warning=FALSE}
+new.dat <- merge(target.df[,c("Tumor_Sample_Barcode", "Hugo_Symbol", "tumor_f")], annot[,c("Tumor_Sample_Barcode", "Histology")], by = "Tumor_Sample_Barcode") |>
+  filter(Hugo_Symbol == "NOTCH1")
+
+new.dat$Histology <- factor(new.dat$Histology, levels = c("Brush", "Normal", "Hyperplasia", "Metaplasia", "Dysplasia"))
+t_test <- new.dat |>
+  t_test(tumor_f ~ Histology) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  add_xy_position()
+
+ggplot(new.dat, aes(x = Histology, y = tumor_f, color = Histology)) + 
+  geom_boxplot(outliers = F, size = 0.25, fatten = 0.75) +
+  geom_beeswarm(method = "swarm", size = 0.05) + theme_classic() + xlab("") + 
+  scale_color_manual(values = c("skyblue","grey45","#3c68b0","#F4AD31","#DE2D26")) + 
+  guides(color="none") +
+  ylab("Variant Allele Frequency") +
+  theme_pcga(angle = 45) +
+  stat_pvalue_manual(data = t_test,
+                     label = "p.adj = {p.adj} {p.adj.signif}",
+                     tip.length = 0.01,
+                     hide.ns = T,
+                     size = 1.5)
+```
+
+### Correlation Between NOTCH1 VAFs & Mutation Number
+
+```{r notch1-vaf-vs-mut, fig.align='center', fig.width=3.5, fig.height=2, fig.dpi=300, fig.cap="Figure 3G", message=FALSE, warning=FALSE}
+biopsy.df <- biopsy.df |> mutate(SampleType = "Biopsy")
+brush.df <- brush.df |> mutate(SampleType = "Brush")
+
+sum_df = bind_rows(biopsy.df, brush.df) |>
+  filter(Hugo_Symbol == 'NOTCH1') |>
+  group_by(Tumor_Sample_Barcode, SampleType) |>
+  summarise(Num_Mut = n(),
+            Mean_VAF = mean(tumor_f)) |>
+  mutate(VAF = ifelse(Mean_VAF > 0.02, 'Sign_VAF', 'Non_sign_VAF'))
+
+ggplot(sum_df, aes(x = Num_Mut, y = Mean_VAF)) +
+  geom_point(aes(color = SampleType), size = 0.75) + 
+  scale_color_manual(values = c("#F8766D","#619CFF")) + 
+  stat_cor(method = "spearman", label.y = 0.06) +
+  geom_smooth(method = "lm", se = T, color = "black", linewidth = 0.5) + xlab("Number of NOTCH1 mutations") +
+  ylab("Average VAF") +
+  scale_x_continuous(breaks = seq(min(sum_df$Num_Mut), max(sum_df$Num_Mut), by = 2)) +
+  theme_bw() + 
+  theme_pcga(angle = 0)
+```
+
+### Session Information
+
+```{r}
+sessionInfo()
+```
+
